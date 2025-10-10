@@ -1,0 +1,9 @@
+ROI,n_spikes_all,n_spikes_in_stim,n_spikes_outside,n_runs
+ROI.01 [],12,9,3,3
+ROI.02 [],12,9,3,3
+ROI.03 [],12,9,3,3
+ROI.04 [],12,9,3,3
+ROI.05 [],13,9,4,3
+ROI.06 [],12,9,3,3
+ROI.07 [],12,9,3,3
+ROI.08 [],12,9,3,3
