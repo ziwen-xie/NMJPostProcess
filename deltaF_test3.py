@@ -18,7 +18,7 @@ from scipy.signal import savgol_filter, butter, filtfilt
 00
 # USER SETTINGS
 # =========================
-CSV_PATH = "./0826/blue3.csv"          # <-- put your CSV name here
+CSV_PATH = "./0806/blue3.csv"          # <-- put your CSV name here
 ENCODING = "utf-16"                  # files from UV-3600/Fiji often are UTF-16
 SKIP_FIRST_ROW = True                # first line is "Channel.001" in your files
 TIME_COL_NAME = "Axis [s]"           # time column name in your CSV

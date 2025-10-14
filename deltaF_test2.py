@@ -12,25 +12,24 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from scipy.signal import find_peaks, peak_widths
 
+
+
 # =========================
-# USER SETTINGS
+# CONFIG
 # =========================
-CSV_PATH = "./T15W5/blue.csv"          # <-- put your CSV name here
+CSV_PATH = "./0718/20-5.csv"          # CSV path
+CSV_BG_PATH = "./0718/bg.csv"          # CSV path
 ENCODING = "utf-16"                  # files from UV-3600/Fiji often are UTF-16
 SKIP_FIRST_ROW = True                # first line is "Channel.001" in your files
 TIME_COL_NAME = "Axis [s]"           # time column name in your CSV
 ROI_KEY = "ROI"                      # columns containing this substring are ROIs
 
-STIM_COLOR = "blue"
+STIM_COLOR = "red"
 STIM_ALPHA = 0.30
-ylim_max = 0.03
+ylim_max = 0.80
 
 # ΔF/F baseline frames
-BASELINE_FRAMES = 29                 # first 59 frames as baseline
-
-# Spike detection parameters
-WINDOW_SEC = 10                      # sliding window length in seconds
-THRESHOLD = 0.008                 # peak-to-peak threshold for "spike"
+BASELINE_FRAMES = 59                 # first 59 frames as baseline
 
 # Stimulation windows (seconds)
 STIM_WINDOWS_20 = [(30, 50), (80, 100), (130, 150)]
@@ -41,12 +40,7 @@ STIM_WINDOWS = STIM_WINDOWS_20
 OUT_FIG = "deltaF_F_plot_10s_spikes_thr0015_red_labels_above_default_legend.png"
 OUT_CSV = "spikes_10s_thr0015.csv"   # set to None if you don’t want a CSV
 
-# ---- SciPy peak detection parameters (tune as needed) ----
-MIN_PROMINENCE = 0.004     # ΔF/F min prominence for a peak (try 0.003–0.01)
-MIN_HEIGHT     = 0.003     # ΔF/F min absolute height (None to disable)
-MIN_DISTANCE_S = 2.0       # min peak-to-peak distance in seconds
-PEAK_WIDTH_S   = None      # optional: min width in seconds (None disables)
-PLOT_PEAK_MARKERS = True   # show small markers at detected peaks
+
 
 # =========================
 # LOAD DATA
@@ -63,8 +57,8 @@ def load_fluo_csv(path: str, encoding="utf-16", skip_first_row=True) -> pd.DataF
             return pd.read_csv(path, encoding=encoding)
 
 df = load_fluo_csv(CSV_PATH, encoding=ENCODING, skip_first_row=SKIP_FIRST_ROW)
-
-
+df_bg = load_fluo_csv(CSV_BG_PATH, encoding=ENCODING, skip_first_row=SKIP_FIRST_ROW)
+df_bg = df['ROI.01 []']
 
 # Identify ROI columns & time column
 roi_cols = [c for c in df.columns if ROI_KEY in c]
@@ -72,6 +66,10 @@ if TIME_COL_NAME not in df.columns:
     raise ValueError(f"Time column '{TIME_COL_NAME}' not found. Columns: {list(df.columns)}")
 
 time = df[TIME_COL_NAME].values
+
+def background_subtraction(F: np.ndarray, t: np.ndarray, bg):
+    dff = F - bg
+    return dff
 
 def compute_dff_8percent_15s(F: np.ndarray, t: np.ndarray, window_half: float = 15.0, perc: float = 8.0):
     n = F.size
@@ -86,121 +84,14 @@ def compute_dff_8percent_15s(F: np.ndarray, t: np.ndarray, window_half: float = 
 
 dff_dict = {}
 for col in roi_cols:
-    dff_vals, _ = compute_dff_8percent_15s(df[col].to_numpy(), time, window_half=15.0, perc=8.0)
+    dff = background_subtraction(df[col].to_numpy(), time, df_bg.to_numpy())
+    dff_vals, _ = compute_dff_8percent_15s(dff, time, window_half=15.0, perc=8.0)
     dff_dict[col] = dff_vals
 
 dff_8pct_15s = pd.DataFrame(dff_dict)
 dff_8pct_15s.insert(0, "Time (s)", time)
 
-dff = dff_8pct_15s.copy()
-for col in roi_cols:
-    dff[col] = np.abs(dff[col])
 
-
-# =========================
-# SPIKE DETECTION (peak-to-peak in a time window)
-# =========================
-
-def detect_spikes(dff_df: pd.DataFrame,
-                  time_col: str,
-                  roi_columns: list[str],
-                  window_sec: float,
-                  threshold: float):
-    """
-    Returns dict {roi: [(start_time, end_time, p2p_change), ...]}
-    Sliding window starts at each time sample.
-    """
-    results = {}
-    t = dff_df[time_col].values
-    for roi in roi_columns:
-        events = []
-        for i in range(len(dff_df)):
-            start = t[i]
-            end = start + window_sec
-            mask = (t >= start) & (t <= end)
-            vals = dff_df.loc[mask, roi].values
-            if vals.size > 0:
-                change = float(vals.max() - vals.min())
-                if change > threshold:
-                    events.append((start, end, change))
-        results[roi] = events
-    return results
-# ---- Helpers to merge windows and summarize counts ----
-def merge_windows(events, gap=0.0):
-    """
-    Merge overlapping/adjacent (within 'gap' seconds) windows.
-    events: list of (start, end, change)
-    Returns: list of merged (start, end, max_change)
-    """
-    if not events:
-        return []
-    ev = sorted(events, key=lambda x: x[0])
-    merged = [list(ev[0])]
-    for s, e, ch in ev[1:]:
-        last = merged[-1]
-        if s <= last[1] + gap:          # overlap or touching within 'gap'
-            last[1] = max(last[1], e)    # extend end
-            last[2] = max(last[2], ch)   # keep max peak-to-peak
-        else:
-            merged.append([s, e, ch])
-    return [tuple(m) for m in merged]
-
-def summarize_spike_counts(spikes_dict, stim_windows=None, gap=0.0,
-                           exclude_before=30.0,
-                           save_csv_path="spike_counts_summary.csv"):
-    """
-    spikes_dict: {roi: [(start, end, change), ...]} from detect_spikes()
-    stim_windows: list[(s,e)] in seconds or None
-    gap: seconds to merge adjacent spikes
-    exclude_before: ignore spikes starting before this time (s)
-    """
-    rows = []
-    for roi, events in spikes_dict.items():
-        # Filter out early events
-        events = [(s, e, ch) for (s, e, ch) in events if s >= exclude_before]
-
-        merged = merge_windows(events, gap=gap)
-
-        if stim_windows:
-            in_stim = 0
-            for s, e, _ in merged:
-                if any((s <= se and e >= ss) for (ss, se) in stim_windows):
-                    in_stim += 1
-            out_stim = len(merged) - in_stim
-        else:
-            in_stim = None
-            out_stim = None
-
-        rows.append({
-            "ROI": roi,
-            "n_spikes_all": len(merged),
-            "n_spikes_in_stim": in_stim,
-            "n_spikes_outside": out_stim
-        })
-
-    summary = pd.DataFrame(rows).sort_values("ROI")
-    summary.to_csv(save_csv_path, index=False)
-    return summary
-
-
-spikes = detect_spikes(dff, "Time (s)", roi_cols, WINDOW_SEC, THRESHOLD)
-spike_summary = summarize_spike_counts(
-    spikes_dict=spikes,
-    stim_windows=STIM_WINDOWS,
-    gap=0.0,                 # merge overlapping windows if needed
-    exclude_before=30.0,     # ignore spikes in first 30 s
-    save_csv_path="spike_counts_summary.csv"
-)
-
-print(spike_summary)
-
-# Optional: write detections to CSV
-if OUT_CSV:
-    rows = []
-    for roi, evs in spikes.items():
-        for (s, e, ch) in evs:
-            rows.append({"ROI": roi, "start_s": s, "end_s": e, "duration_s": e - s, "peak_to_peak": ch})
-    pd.DataFrame(rows).to_csv(OUT_CSV, index=False)
 
 # =========================
 # PLOTTING
@@ -215,23 +106,12 @@ color_map = {roi_cols[i]: colors[i % len(colors)] for i in range(len(roi_cols))}
 
 # Plot ΔF/F traces
 for col in roi_cols:
-    ax.plot(dff["Time (s)"], dff[col], label=col, linewidth=1.2, color=color_map[col])
+    ax.plot(dff_8pct_15s["Time (s)"], dff_8pct_15s[col], label=col, linewidth=1.2, color=color_map[col])
 
 # Red stimulation windows
 for (s, e) in STIM_WINDOWS:
     ax.axvspan(s, e, color=STIM_COLOR, alpha=STIM_ALPHA)
 
-# Blue markers at TOP + labels ABOVE the plot
-# We use axis-transform so markers/labels sit at the top margin
-# for roi, evs in spikes.items():
-#     for (start, end, change) in evs:
-#         # Marker at top edge of axes (y=1.0 in axes coords)
-#         ax.plot([start], [1.0], marker="v", markersize=4, color="blue",
-#                 transform=ax.get_xaxis_transform(), clip_on=False)
-#         # Label just above the axes
-#         ax.text(start, 1.04, f"{roi}  Δ={change:.3f}",
-#                 transform=ax.get_xaxis_transform(),
-#                 rotation=90, fontsize=6, ha="center", va="bottom", clip_on=False)
 
 # Styling
 ax.axhline(0, linestyle="--", linewidth=1)

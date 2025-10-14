@@ -1,8 +1,9 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
 # Load the uploaded CSV
-file_path = "./0819/20-1.csv"
+file_path = "./0718/20-4.csv"
 df = pd.read_csv(file_path, encoding='utf-16', skiprows=1)
 
 # Preview the first few rows to understand structure
@@ -13,7 +14,7 @@ roi_cols = [col for col in df.columns if "ROI" in col]
 baseline = df.loc[:29, roi_cols].mean()
 
 # Calculate ΔF/F
-deltaF_F = (df[roi_cols] - baseline) / baseline
+deltaF_F = np.abs(df[roi_cols] - baseline) / baseline
 deltaF_F.insert(0, "Time (s)", df["Axis [s]"])
 
 # Prepare the plot
@@ -30,8 +31,8 @@ for start, end in stim_windows:
 plt.axhline(0, linestyle='--', linewidth=1)
 plt.xlabel("Time (s)")
 plt.ylabel("ΔF/F")
-plt.title("ΔF/F Over Time for 5s Constant light")
-plt.legend()
+plt.title("ΔF/F Over Time normal baseline")
+# plt.legend()
 plt.tight_layout()
 
 plt.show()
