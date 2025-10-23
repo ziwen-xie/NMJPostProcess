@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Tuple, List, Optional, Dict
 
@@ -57,6 +57,8 @@ class Config:
     out_csv: Optional[str] = None  # e.g., "dff_table.csv"
 
     # Spike detection
+    baseline_index_start: int = 10
+    baseline_index_end: int = 20
     baseline_frames_for_spike: int = 29
     spike_z_sigma: float = 5.0
     min_spike_distance_s: Optional[float] = None  # e.g., 2.0 to avoid double-counting within 2 s
@@ -86,6 +88,10 @@ class Config:
     # Spike width filter
     width_mode: str = "rough"  # "rough" or "fwhm"
     width_threshold_s: float = 0.50  # minimum width (seconds) to count a spike
+
+    # ROIs to exclude from plotting (exact column names).
+    # Set to True to exclude; missing keys or False => included.
+    exclude_roi_map: Dict[str, bool] = field(default_factory=dict)
 
     def __post_init__(self):
         presets: Dict[str, List[Tuple[float, float]]] = {
@@ -194,7 +200,7 @@ def dff_percentile_window(
         t1 = min(t[-1], t[i] + window_half_s)
         idx = (t >= t0) & (t <= t1)
         F0[i] = np.percentile(F[idx], percentile)
-    dff = np.abs((F - F0) / (F0))
+    dff = (F - F0) / (F0)
     return dff, F0
 
 
@@ -230,7 +236,10 @@ def plot_dff(
     spike_times: Optional[Dict[str, np.ndarray]] = None,
 ) -> plt.Figure:
 
-    roi_cols_for_plot = list(roi_cols)
+    # Start from given list and apply user exclusions
+    roi_cols_for_plot = apply_roi_exclusions(list(roi_cols), cfg)
+
+    # Optionally also drop the background ROI if requested
     if bg_was_roi and cfg.exclude_bg_roi_from_plot:
         roi_cols_for_plot = [c for c in roi_cols_for_plot if c != cfg.bg_column_name]
 
@@ -239,19 +248,15 @@ def plot_dff(
     colors = plt.get_cmap(cfg.cmap_name).colors
     color_map = {roi_cols_for_plot[i]: colors[i % len(colors)] for i in range(len(roi_cols_for_plot))}
 
-    # Lines
     for col in roi_cols_for_plot:
         ax.plot(dff_table["Time (s)"], dff_table[col], label=col, linewidth=1.2, color=color_map[col])
 
-    # Stim windows
     for s, e in cfg.stim_windows:
         ax.axvspan(s, e, color=cfg.stim_color, alpha=cfg.stim_alpha)
 
-    # Spike overlay (markers + optional summary box)
     if spike_times is not None:
         overlay_spikes_on_axes(ax, dff_table, roi_cols_for_plot, spike_times, color_map, cfg)
 
-    # Style
     ax.axhline(0, linestyle="--", linewidth=1)
 
     if cfg.use_auto_ylim:
@@ -275,6 +280,7 @@ def plot_dff(
 
     fig.tight_layout()
     return fig
+
 
 
 #===================
@@ -343,6 +349,24 @@ def _baseline_stats_first_n(y: np.ndarray, spike_z_sigma, n: int) -> Tuple[float
     thr = mean0 + spike_z_sigma * (sd0 if sd0 > 0 else 1e-12)
     return mean0, sd0, thr
 
+def _baseline_stats_frame_range(
+    y: np.ndarray, spike_z_sigma: float, start_idx: int, end_idx: int
+) -> Tuple[float, float, float]:
+    """Baseline stats on y[start_idx : end_idx] inclusive."""
+    n = y.size
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    # normalize and clamp
+    s = max(0, min(start_idx, end_idx))
+    e = min(n - 1, max(start_idx, end_idx))
+    base = y[s:e+1]
+    if base.size == 0:
+        base = y[:1]  # fallback to at least one sample
+
+    mean0 = float(np.mean(base))
+    sd0 = float(np.std(base, ddof=1)) if base.size > 1 else 0.0
+    thr = mean0 + spike_z_sigma * (sd0 if sd0 > 0 else 1e-12)
+    return mean0, sd0, thr
 
 def _rising_crossings(y: np.ndarray, thr: float) -> np.ndarray:
     """
@@ -374,44 +398,40 @@ def detect_spikes_across_rois(
     dff_table: pd.DataFrame,
     roi_cols: List[str],
     time_col: str = "Time (s)",
-    baseline_frames: int = 59,
+    baseline_frames: Optional[int] = None,              # kept for backward compat
+    baseline_range: Optional[Tuple[int,int]] = None,    # NEW: (start_idx, end_idx), inclusive
     spike_z_sigma: float = 3.0,
     min_distance_s: Optional[float] = None,
-    width_mode: str = "rough",  # "rough" or "fwhm"
-    width_threshold_s: float = 0.50,  # seconds
+    width_mode: str = "rough",
+    width_threshold_s: float = 0.50,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, np.ndarray]]:
     t = dff_table[time_col].to_numpy(dtype=float)
 
-    stats_rows = []
-    summary_rows = []
+    stats_rows, summary_rows = [], []
     spike_times: Dict[str, np.ndarray] = {}
 
     for col in roi_cols:
         y = dff_table[col].to_numpy(dtype=float)
 
-        # baseline on first N frames
-        mean0, sd0, thr = _baseline_stats_first_n(y, spike_z_sigma,baseline_frames)
+        # --- Baseline stats: prefer explicit range, else fall back to first-N ---
+        if baseline_range is not None:
+            mean0, sd0, thr = _baseline_stats_frame_range(
+                y, spike_z_sigma, baseline_range[0], baseline_range[1]
+            )
+        else:
+            n = 59 if baseline_frames is None else baseline_frames
+            mean0, sd0, thr = _baseline_stats_first_n(y, spike_z_sigma, n)
 
-        # Segments where y > thr
         runs = _segments_above_threshold(y, thr)
-
         accepted_peak_idxs: list[int] = []
-        peak_times_tmp: list[float] = []
 
         for run in runs:
-            # peak index inside this run
             k_peak = run[np.argmax(y[run])]
-
-            # measure widths
             rough_w, fwhm_w = _measure_run_widths(y, t, run, k_peak, baseline_mean=mean0)
             measured = rough_w if width_mode.lower() == "rough" else fwhm_w
-
-            # width criterion
             if np.isfinite(measured) and (measured >= width_threshold_s):
                 accepted_peak_idxs.append(int(k_peak))
-                peak_times_tmp.append(float(t[k_peak]))
 
-        # min-distance thinning (optional)
         if accepted_peak_idxs:
             accepted_peak_idxs = np.array(sorted(accepted_peak_idxs), dtype=int)
             accepted_peak_idxs = _enforce_min_distance(accepted_peak_idxs, t, min_distance_s)
@@ -419,15 +439,17 @@ def detect_spikes_across_rois(
         else:
             peak_times = np.array([], dtype=float)
 
-        # record
         stats_rows.append({"ROI": col, "mean0": mean0, "sd0": sd0, "thr": thr})
         spike_times[col] = peak_times
         if peak_times.size > 0:
             summary_rows.append({"ROI": col, "n_spikes": int(peak_times.size)})
 
     stats_df = pd.DataFrame(stats_rows)
-    summary_df = pd.DataFrame(summary_rows).sort_values("n_spikes", ascending=False).reset_index(drop=True)
+    summary_df = pd.DataFrame(summary_rows, columns=["ROI", "n_spikes"])
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values("n_spikes", ascending=False).reset_index(drop=True)
     return summary_df, stats_df, spike_times
+
 
 
 def overlay_spikes_on_axes(
@@ -554,8 +576,12 @@ def compute_auto_ylim(
     else:
         pad = span * pad_frac
 
-    return (y_min - pad, y_max + pad)
+    return (0, y_max + pad)
 
+def apply_roi_exclusions(roi_cols: List[str], cfg: Config) -> List[str]:
+    """Return ROI columns after removing any marked True in cfg.exclude_roi_map."""
+    excluded = {k for k, v in cfg.exclude_roi_map.items() if v}
+    return [c for c in roi_cols if c not in excluded]
 
 # =========================
 # run
@@ -587,8 +613,8 @@ def run(cfg: Config):
         dff_table=dff_table,
         roi_cols=roi_cols_for_detection,
         time_col="Time (s)",
-        baseline_frames=cfg.baseline_frames_for_spike,
-        spike_z_sigma =cfg.spike_z_sigma,
+        baseline_range=(cfg.baseline_index_start, cfg.baseline_index_end),  # ← use 10–20
+        spike_z_sigma=cfg.spike_z_sigma,
         min_distance_s=cfg.min_spike_distance_s,
         width_mode=cfg.width_mode,
         width_threshold_s=cfg.width_threshold_s,
@@ -655,7 +681,7 @@ def run(cfg: Config):
 # =========================
 if __name__ == "__main__":
     cfg = Config(
-        csv_path="./0718/20-7.csv",
+        csv_path="./0806FS2/2mW2.csv",
         encoding="utf-16",
         skip_first_row=True,
         time_col="Axis [s]",
@@ -663,7 +689,7 @@ if __name__ == "__main__":
 
         # Background selection:
         bg_source="roi_column",            # "roi_column" or "csv_file"
-        bg_column_name="ROI.01 []",        # used if bg_source == "roi_column"
+        bg_column_name="ROI.000 []",        # used if bg_source == "roi_column"
         bg_csv_path="./0718/bg.csv",       # used if bg_source == "csv_file"
         bg_csv_col_name=None,              # set to a column name if needed
 
@@ -690,7 +716,9 @@ if __name__ == "__main__":
         out_csv=None,  # e.g., "dff_table.csv"
 
         # Spike detection
-        baseline_frames_for_spike= 59,
+        baseline_index_start = 20,
+        baseline_index_end = 40,
+        baseline_frames_for_spike= 29,
         spike_z_sigma = 3.0,
         min_spike_distance_s= 20,  # e.g., 2.0 to avoid double-counting within 2 s
         exclude_bg_roi_from_detection = True,  # usually True if bg ROI is ROI.01
@@ -722,11 +750,18 @@ if __name__ == "__main__":
 
         # Spike width filter
         width_mode = "rough",  # "rough" or "fwhm"
-        width_threshold_s = 0.50  # minimum width (seconds) to count a spike
+        width_threshold_s = 4,  # minimum width (seconds) to count a spike
+        # ROIs to exclude from plotting (exact column names).
+        # Set to True to exclude; missing keys or False => included.
+        exclude_roi_map ={
+            # "ROI.21 []": True,
+            # "ROI.15 []": True,
+        },
 
     )
 
     _dff, fig_all, fig_spk = run(cfg)
     a = fig_spk.show()
 
+# single ROI different traces
 
