@@ -39,13 +39,13 @@ class Config:
 
     # Plot behavior
     exclude_bg_roi_from_plot: bool = True
-    ylim_max: float = 0.80
+    ylim_max: float = 0.3
     fig_size: Tuple[float, float] = (10, 6)
     cmap_name: str = "tab10"
     stim_color: str = "red"
     stim_alpha: float = 0.30
-    use_auto_ylim: bool = True
-    auto_ylim_include_zero: bool = True
+    use_auto_ylim: bool = False
+    auto_ylim_include_zero: bool = False
     auto_ylim_pad_frac: float = 0.05
     ylim_min: Optional[float] = 0.0
 
@@ -96,6 +96,18 @@ class Config:
 
     # ROIs to exclude from plotting
     exclude_roi_map: Dict[str, bool] = field(default_factory=dict)
+
+    # Stimulation windows
+    stim_preset: str = "20s"
+    stim_windows_custom: Optional[List[Tuple[float, float]]] = None
+    stim_windows: List[Tuple[float, float]] = None
+
+    ### NEW — spike exclusion w.r.t. stim windows
+    exclude_spikes_in_stim: bool = False  # don't count spikes that fall inside a stim window
+    stim_exclusion_pad_s: float = 0.0  # +/- padding (seconds) around each window for exclusion
+
+    ### NEW — auto infer stim preset from filename (e.g., "20s-1.csv", "10-2.csv", "5s_x.csv")
+    stim_preset_infer_from_name: bool = True  # if True, infer from csv filename; otherwise honor stim_preset
 
     def __post_init__(self):
         presets = {
@@ -385,6 +397,65 @@ def plot_dff(
     fig.tight_layout()
     return fig
 
+def infer_stim_preset_from_string(s: str) -> str:
+    """
+    Infer '20s' / '10s' / '5s' from a string (filename or group name).
+    Rules:
+      - If it contains '20s' or a '20-' pattern -> '20s'
+      - If it contains '10s' or a '10-' pattern -> '10s'
+      - If it contains '5s'  or a '5-'  pattern -> '5s'
+      - Otherwise default to '20s'
+    Matching is case-insensitive.
+    """
+    s_low = s.lower()
+    # explicit 'xs' first (e.g., 20s-3, 10s_2, 5s)
+    if "20s" in s_low or re.search(r"\b20[-_]", s_low):
+        return "20s"
+    if "10s" in s_low or re.search(r"\b10[-_]", s_low):
+        return "10s"
+    if "5s"  in s_low or re.search(r"\b5[-_]",  s_low):
+        return "5s"
+    return "20s"
+
+def apply_inferred_stim_preset(cfg: Config, name_hint: Optional[str] = None) -> None:
+    """
+    If cfg.stim_preset_infer_from_name is True, infer from csv filename (or provided name_hint),
+    then update cfg.stim_preset and cfg.stim_windows accordingly.
+    """
+    if not cfg.stim_preset_infer_from_name:
+        return
+
+    source = name_hint if name_hint else Path(cfg.csv_path).name
+    inferred = infer_stim_preset_from_string(source)
+
+    # Rebuild preset windows exactly like __post_init__ does
+    presets = {
+        "20s": [(30, 50), (80, 100), (130, 150)],
+        "10s": [(30, 40), (70, 80), (110, 120)],
+        "5s":  [(30, 35), (65, 70), (100, 105)],
+        "none": [],
+    }
+
+    cfg.stim_preset = inferred
+    cfg.stim_windows = presets[cfg.stim_preset]
+
+
+def filter_times_outside_windows(
+    times: np.ndarray,
+    windows: Optional[List[Tuple[float, float]]],
+    pad: float = 0.0
+) -> np.ndarray:
+    """
+    Return times that are NOT inside any [start-pad, end+pad] window.
+    """
+    if times.size == 0 or not windows:
+        return times
+    keep_mask = np.ones(times.shape[0], dtype=bool)
+    for (s, e) in windows:
+        in_win = (times >= (s - pad)) & (times <= (e + pad))
+        keep_mask &= ~in_win
+    return times[keep_mask]
+
 
 def _segments_above_threshold(y: np.ndarray, thr: float) -> List[np.ndarray]:
     above = y > thr
@@ -475,6 +546,9 @@ def detect_spikes_across_rois(
         min_distance_s: Optional[float] = None,
         width_mode: str = "rough",
         width_threshold_s: float = 0.50,
+        stim_windows: Optional[List[Tuple[float, float]]] = None,
+        exclude_spikes_in_windows: bool = False,
+        stim_exclusion_pad_s: float = 0.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, np.ndarray]]:
     t = dff_table[time_col].to_numpy(dtype=float)
 
@@ -509,6 +583,11 @@ def detect_spikes_across_rois(
 
             # Exclude spikes before 10 seconds
             peak_times = peak_times[peak_times >= 10.0]
+
+            if exclude_spikes_in_windows and stim_windows:
+                peak_times = filter_times_outside_windows(
+                    peak_times, stim_windows, pad=stim_exclusion_pad_s
+                )
         else:
             peak_times = np.array([], dtype=float)
 
@@ -664,6 +743,9 @@ def plot_single_roi_across_experiments(
                 min_distance_s=cfg.min_spike_distance_s,
                 width_mode=cfg.width_mode,
                 width_threshold_s=cfg.width_threshold_s,
+                stim_windows=cfg.stim_windows,
+                exclude_spikes_in_windows=cfg.exclude_spikes_in_stim,
+                stim_exclusion_pad_s=cfg.stim_exclusion_pad_s,
             )
             ptimes = spike_times.get(roi_col, np.array([], dtype=float))
             if ptimes.size > 0:
@@ -708,10 +790,22 @@ def plot_single_roi_across_experiments_flat(
     figsize: Tuple[float, float] = (12, 7),
     title: Optional[str] = None,
     out_path: Optional[str] = None,
+
+    # NEW: fixed-scale options
+    use_fixed_scale: bool = False,
+    fixed_min: Optional[float] = None,
+    fixed_max: Optional[float] = None,
 ) -> plt.Figure:
     """
     Plot one ROI across multiple experiments as horizontally stacked traces.
     Each experiment appears at a distinct y-level labeled by its experiment name.
+
+    If use_fixed_scale is False (default), each experiment is normalized to its own
+    [min, max] range before being shifted (current behavior).
+
+    If use_fixed_scale is True, all experiments share the same normalization range:
+        - If fixed_min/fixed_max are provided, use those.
+        - Otherwise infer global min/max across all experiments for this ROI.
     """
     from dataclasses import replace
 
@@ -725,31 +819,102 @@ def plot_single_roi_across_experiments_flat(
     cmap = plt.get_cmap("tab10")
     color_cycle = [cmap(i % 10) for i in range(20)]
 
-    for i, csv_path in enumerate(sorted(files)):
+    # --- FIRST PASS: load & compute dFF for each file, gather stats if needed ---
+    traces = []  # each element: dict with keys: csv_path, cfg, t, dff_vals
+    global_min = np.inf
+    global_max = -np.inf
+
+    for csv_path in sorted(files):
         cfg = replace(base_cfg)
         cfg.csv_path = str(csv_path)
 
         df = load_fluo_csv(cfg.csv_path, encoding=cfg.encoding, skip_first_row=cfg.skip_first_row)
         if cfg.time_col not in df.columns:
             continue
+
         t = df[cfg.time_col].to_numpy(dtype=float)
         roi_cols = find_roi_columns(df, cfg.roi_key)
         roi_col = _find_roi_col_by_number(roi_cols, roi_num)
         if roi_col is None:
             continue
 
-        bg_vec = select_background(df, cfg)
-        F_corr = background_subtraction(df[roi_col].to_numpy(dtype=float), bg_vec)
-        dff_vals, _ = dff_percentile_window(F_corr, t, cfg.baseline_window_half_s, cfg.baseline_percentile)
+        try:
+            bg_vec = select_background(df, cfg)
+        except Exception as e:
+            print(f"[WARN] Could not select background for {csv_path.name}: {e}; skipping.")
+            continue
 
-        # Normalize or rescale trace to fit visually
-        dff_norm = (dff_vals - np.nanmin(dff_vals)) / (np.nanmax(dff_vals) - np.nanmin(dff_vals) + 1e-9)
+        F_corr = background_subtraction(df[roi_col].to_numpy(dtype=float), bg_vec)
+        dff_vals, _ = dff_percentile_window(
+            F_corr, t, cfg.baseline_window_half_s, cfg.baseline_percentile
+        )
+
+        traces.append(
+            {
+                "csv_path": csv_path,
+                "cfg": cfg,
+                "t": t,
+                "roi_col": roi_col,
+                "dff_vals": dff_vals,
+            }
+        )
+
+        # For fixed scale, track global min/max unless user provides explicit limits
+        if use_fixed_scale or (fixed_min is not None or fixed_max is not None):
+            local_min = float(np.nanmin(dff_vals))
+            local_max = float(np.nanmax(dff_vals))
+            global_min = min(global_min, local_min)
+            global_max = max(global_max, local_max)
+
+    if not traces:
+        raise ValueError("No valid traces to plot for this ROI (check filters/ROI number).")
+
+    # Determine normalization range for fixed scale (if requested)
+    if fixed_min is not None or fixed_max is not None:
+        # Use explicit values when provided; fall back to inferred global when missing
+        norm_min = fixed_min if fixed_min is not None else global_min
+        norm_max = fixed_max if fixed_max is not None else global_max
+    else:
+        # Auto from global stats
+        norm_min = global_min
+        norm_max = global_max
+
+    if use_fixed_scale:
+        denom_global = norm_max - norm_min
+        if denom_global <= 0 or not np.isfinite(denom_global):
+            denom_global = 1e-9  # fallback to avoid division by zero
+
+    # --- SECOND PASS: actually plot ---
+    for i, trace in enumerate(traces):
+        csv_path = trace["csv_path"]
+        cfg = trace["cfg"]
+        t = trace["t"]
+        roi_col = trace["roi_col"]
+        dff_vals = trace["dff_vals"]
+
+        # Choose normalization mode
+        if use_fixed_scale:
+            dff_norm = (dff_vals - norm_min) / (denom_global + 1e-9)
+        else:
+            local_min = float(np.nanmin(dff_vals))
+            local_max = float(np.nanmax(dff_vals))
+            denom = local_max - local_min
+            if denom <= 0 or not np.isfinite(denom):
+                denom = 1e-9
+            dff_norm = (dff_vals - local_min) / (denom + 1e-9)
 
         # Offset by experiment index
         y_offset = i * y_step
         color = color_cycle[i % len(color_cycle)]
-        ax.plot(t, dff_norm + y_offset, color=color, lw=linewidth)
 
+        # Shade stim windows (behind traces)
+        for s, e in cfg.stim_windows:
+            ax.axvspan(s, e, color=cfg.stim_color, alpha=0.2, zorder=0)
+
+        # Plot normalized, shifted trace
+        ax.plot(t, dff_norm + y_offset, color=color, lw=linewidth, label=None)
+
+        # Optionally detect & overlay spikes
         if show_spikes:
             dff_table = pd.DataFrame({"Time (s)": t, roi_col: dff_vals})
             _, _, spike_times = detect_spikes_across_rois(
@@ -761,29 +926,48 @@ def plot_single_roi_across_experiments_flat(
                 min_distance_s=cfg.min_spike_distance_s,
                 width_mode=cfg.width_mode,
                 width_threshold_s=cfg.width_threshold_s,
+                stim_windows=cfg.stim_windows,
+                exclude_spikes_in_windows=cfg.exclude_spikes_in_stim,
+                stim_exclusion_pad_s=cfg.stim_exclusion_pad_s,
             )
+
+            # Save raw dFF table for this ROI/file (unchanged behavior)
+            out_csv = Path(batch_cfg.output_root) / f"dff_table_ROI{roi_num:02d}_{csv_path.stem}.csv"
+            dff_table.to_csv(out_csv, index=False)
+            print(f"💾 Saved {out_csv}")
+
             ptimes = spike_times.get(roi_col, np.array([], dtype=float))
             if ptimes.size:
-                ax.scatter(ptimes, np.full_like(ptimes, y_offset),
-                           marker=spike_marker, s=spike_size,
-                           facecolors="none", edgecolors=color, lw=1.2)
+                ax.scatter(
+                    ptimes,
+                    np.full_like(ptimes, y_offset),
+                    marker=spike_marker,
+                    s=spike_size,
+                    facecolors="none",
+                    edgecolors=color,
+                    lw=1.2,
+                    zorder=5,
+                )
 
-        # shade stim windows
-        for s, e in cfg.stim_windows:
-            ax.axvspan(s, e, color=cfg.stim_color, alpha=0.2, zorder=0)
-
+    # Y-axis labels (one per experiment)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Experiment #")
-    ax.set_yticks(np.arange(len(files)) * y_step)
-    ax.set_yticklabels([p.stem for p in sorted(files)], fontsize=8)
-    ax.set_title(title or f"ROI{roi_num:02d} traces across experiments", fontweight="bold")
-    ax.grid(True, axis="x", alpha=0.3, linestyle="--", lw=0.5)
+    ax.set_yticks(np.arange(len(traces)) * y_step)
+    ax.set_yticklabels([t["csv_path"].stem for t in traces], fontsize=8)
 
+    effective_title = title or f"ROI{roi_num:02d} traces across experiments"
+    if use_fixed_scale:
+        effective_title += f" (fixed scale [{norm_min:.2f}, {norm_max:.2f}])"
+    ax.set_title(effective_title, fontweight="bold")
+
+    ax.grid(True, axis="x", alpha=0.3, linestyle="--", lw=0.5)
     fig.tight_layout()
+
     if out_path:
         fig.savefig(out_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"✅ Saved to {out_path}")
+
     return fig
 
 def run(cfg: Config):
@@ -815,6 +999,9 @@ def run(cfg: Config):
         min_distance_s=cfg.min_spike_distance_s,
         width_mode=cfg.width_mode,
         width_threshold_s=cfg.width_threshold_s,
+        stim_windows=cfg.stim_windows,
+        exclude_spikes_in_windows=cfg.exclude_spikes_in_stim,
+        stim_exclusion_pad_s=cfg.stim_exclusion_pad_s,
     )
 
     if cfg.out_spike_csv:
@@ -913,6 +1100,10 @@ def process_single_file(
         if overrides:
             for key, value in overrides.items():
                 setattr(cfg, key, value)
+
+        if not overrides or ("stim_preset" not in overrides and cfg.stim_preset_infer_from_name):
+            apply_inferred_stim_preset(cfg, name_hint=csv_path.name)
+
 
         output_dir.mkdir(parents=True, exist_ok=True)
         cfg.out_fig = str(output_dir / "deltaF_F_plot_all.png")
@@ -1353,7 +1544,96 @@ def plot_raster(
         print(f"Raster plot saved to: {output_path}")
 
     return fig
+from pathlib import Path
 
+def list_all_roi_numbers(
+    batch_cfg: BatchConfig,
+    base_cfg: Config,
+    files_filter: Optional[List[str]] = None,
+    max_files: Optional[int] = None,
+) -> List[int]:
+    """
+    Scan CSVs and return the sorted union of ROI numbers present.
+    """
+    files = discover_csv_files(batch_cfg)
+    if files_filter:
+        files = [p for p in files if any(f in p.name or f in p.stem for f in files_filter)]
+    if max_files is not None:
+        files = files[:max_files]
+
+    roi_nums: set[int] = set()
+    for csv_path in files:
+        try:
+            df = load_fluo_csv(str(csv_path), encoding=base_cfg.encoding, skip_first_row=base_cfg.skip_first_row)
+            roi_cols = find_roi_columns(df, base_cfg.roi_key)
+            for c in roi_cols:
+                n = extract_roi_number(c)
+                if n is not None:
+                    roi_nums.add(n)
+        except Exception as e:
+            print(f"[WARN] Could not inspect {csv_path.name}: {e}")
+            continue
+
+    return sorted(roi_nums)
+
+
+def generate_flat_figs_for_all_rois(
+    batch_cfg: BatchConfig,
+    base_cfg: Config,
+    roi_list: Optional[List[int]] = None,
+    files_filter: Optional[List[str]] = None,
+    out_dir: Optional[str] = None,
+    y_step: float = 1.2,
+    show_spikes: bool = True,
+    linewidth: float = 1.2,
+    figsize: Tuple[float, float] = (12, 7),
+) -> List[Path]:
+    """
+    For each ROI, generate a flat figure (ROI across all experiments) and save it.
+
+    Args:
+        roi_list: if None, auto-discovers all ROI numbers present.
+        files_filter: optional substrings to include certain files only.
+        out_dir: folder to save images. Defaults to '<output_root>/roi_flat'.
+    Returns:
+        List of saved file paths.
+    """
+    save_root = Path(out_dir) if out_dir else Path(batch_cfg.output_root) / "roi_flat"
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    if roi_list is None:
+        roi_list = list_all_roi_numbers(batch_cfg, base_cfg, files_filter=files_filter)
+
+    saved: List[Path] = []
+    for roi_num in roi_list:
+        try:
+            out_path = save_root / f"ROI{roi_num:02d}_flat.png"
+            _ = plot_single_roi_across_experiments_flat(
+                roi_num=roi_num,
+                batch_cfg=batch_cfg,
+                base_cfg=base_cfg,
+                files_filter=files_filter,
+                y_step=y_step,
+                linewidth=linewidth,
+                show_spikes=show_spikes,
+                figsize=figsize,
+                title=f"ROI{roi_num:02d} traces across experiments",
+                out_path=str(out_path),
+                use_fixed_scale=True,
+                fixed_min=0.0,  # optional (else inferred)
+                fixed_max=1.0,
+            )
+            saved.append(out_path)
+            print(f"✅ Saved {out_path}")
+        except Exception as e:
+            print(f"[WARN] Failed for ROI{roi_num:02d}: {e}")
+            continue
+
+    if not saved:
+        print("No ROI flat figures were generated.")
+    else:
+        print(f"\nDone. Generated {len(saved)} ROI flat figures → {save_root}")
+    return saved
 
 def create_raster_plot_from_batch(
         batch_cfg: BatchConfig,
@@ -1635,22 +1915,23 @@ if __name__ == "__main__":
             baseline_window_half_s=30.0,
             baseline_percentile=8.0,
             stim_preset="20s",
-            baseline_index_start=20,
-            baseline_index_end=40,
+            baseline_index_start=10,
+            baseline_index_end=30,
             spike_z_sigma=3.0,
             min_spike_distance_s=15,
             width_mode="rough",
             width_threshold_s=4.0,
-            use_auto_ylim=True,
+            use_auto_ylim=False,
             show_spike_markers=True,
             show_spiking_only_figure=True,
             out_fig=None,
             out_spike_csv=None,
             out_spike_stats_csv=None,
+
         )
 
         batch_cfg = BatchConfig(
-            input_folder="./0806FS2",
+            input_folder="./1125",
             file_pattern="*.csv",
             output_root="./batch_results",
             shared_config=shared_config,
@@ -1684,27 +1965,87 @@ if __name__ == "__main__":
         print(f"Raster plot (timeline): {batch_cfg.output_root}/spike_raster_timeline.png")
         print(f"All spike timestamps: {batch_cfg.output_root}/all_spike_timestamps.csv")
 
-        # Plot ROI 5 across two specific experiments (match by filename substrings)
-        fig = plot_single_roi_across_experiments(
-            roi_num=7,
+
+
+        # fig = plot_single_roi_across_experiments_flat(
+        #     roi_num=3,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2","20-2"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI03_flat.png",
+        # )
+        #
+        # fig2 = plot_single_roi_across_experiments_flat(
+        #     roi_num=5,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-1","20-2"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI05_flat.png",
+        # )
+        #
+        # fig3 = plot_single_roi_across_experiments_flat(
+        #     roi_num=8,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-3","2hz1","2hz3","5hz1","5hz3"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI08_flat.png",
+        # )
+        #
+        # fig4 = plot_single_roi_across_experiments_flat(
+        #     roi_num=9,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-3","2hz1","2hz3","5hz2","20-2"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI09_flat.png",
+        # )
+        #
+        # fig5 = plot_single_roi_across_experiments_flat(
+        #     roi_num=10,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-1", "5hz1", "5hz2", "5hz3", "20-2"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI10_flat.png",
+        # )
+        #
+        # fig6 = plot_single_roi_across_experiments_flat(
+        #     roi_num=12,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-2", "2hz1", "2hz2", "5hz1", "20-1"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI12_flat.png",
+        # )
+        #
+        # fig7 = plot_single_roi_across_experiments_flat(
+        #     roi_num=13,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-2", "2hz1", "2hz2", "20-1"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI13_flat.png",
+        # )
+
+
+        _ = generate_flat_figs_for_all_rois(
             batch_cfg=batch_cfg,
             base_cfg=shared_config,
-            files_filter=["20s1", "2mW2"],  # ← your example
-            y_shift=0.3,
-            show_spikes=True,
-        )
-
-        out_path = "./batch_results/ROI05_across_experiments.png"
-        fig.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print("✅ Saved ROI05_across_experiments.png")
-
-        fig = plot_single_roi_across_experiments_flat(
-            roi_num=5,
-            batch_cfg=batch_cfg,
-            base_cfg=shared_config,
-            files_filter=["Ctrl1", "Ctrl2", "Ctrl3", "20s1", "2mW2"],
+            roi_list=None,  # auto-discover all ROI numbers
+            files_filter=None,  # or e.g. ["Ctrl", "10-1"] to subset
+            out_dir="batch_results/roi_flat",
             y_step=1.2,
             show_spikes=True,
-            out_path="./batch_results/ROI05_flat.png",
+            linewidth=1.2,
+            figsize=(12, 7),
         )

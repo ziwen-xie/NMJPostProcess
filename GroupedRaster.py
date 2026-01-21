@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Load CSV again
-csv_path = "batch_results/spike_summary_table.csv"
+csv_path = "0806_batch_results/spike_summary_table.csv"
 df = pd.read_csv(csv_path)
 
 # Sum replicates for each condition

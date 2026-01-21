@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -37,13 +39,13 @@ class Config:
 
     # Plot behavior
     exclude_bg_roi_from_plot: bool = True
-    ylim_max: float = 0.80
+    ylim_max: float = 1
     fig_size: Tuple[float, float] = (10, 6)
     cmap_name: str = "tab10"
     stim_color: str = "red"
     stim_alpha: float = 0.30
-    use_auto_ylim: bool = True
-    auto_ylim_include_zero: bool = True
+    use_auto_ylim: bool = False
+    auto_ylim_include_zero: bool = False
     auto_ylim_pad_frac: float = 0.05
     ylim_min: Optional[float] = 0.0
 
@@ -94,6 +96,18 @@ class Config:
 
     # ROIs to exclude from plotting
     exclude_roi_map: Dict[str, bool] = field(default_factory=dict)
+
+    # Stimulation windows
+    stim_preset: str = "20s"
+    stim_windows_custom: Optional[List[Tuple[float, float]]] = None
+    stim_windows: List[Tuple[float, float]] = None
+
+    ### NEW — spike exclusion w.r.t. stim windows
+    exclude_spikes_in_stim: bool = False  # don't count spikes that fall inside a stim window
+    stim_exclusion_pad_s: float = 0.0  # +/- padding (seconds) around each window for exclusion
+
+    ### NEW — auto infer stim preset from filename (e.g., "20s-1.csv", "10-2.csv", "5s_x.csv")
+    stim_preset_infer_from_name: bool = True  # if True, infer from csv filename; otherwise honor stim_preset
 
     def __post_init__(self):
         presets = {
@@ -383,6 +397,65 @@ def plot_dff(
     fig.tight_layout()
     return fig
 
+def infer_stim_preset_from_string(s: str) -> str:
+    """
+    Infer '20s' / '10s' / '5s' from a string (filename or group name).
+    Rules:
+      - If it contains '20s' or a '20-' pattern -> '20s'
+      - If it contains '10s' or a '10-' pattern -> '10s'
+      - If it contains '5s'  or a '5-'  pattern -> '5s'
+      - Otherwise default to '20s'
+    Matching is case-insensitive.
+    """
+    s_low = s.lower()
+    # explicit 'xs' first (e.g., 20s-3, 10s_2, 5s)
+    if "20s" in s_low or re.search(r"\b20[-_]", s_low):
+        return "20s"
+    if "10s" in s_low or re.search(r"\b10[-_]", s_low):
+        return "10s"
+    if "5s"  in s_low or re.search(r"\b5[-_]",  s_low):
+        return "5s"
+    return "20s"
+
+def apply_inferred_stim_preset(cfg: Config, name_hint: Optional[str] = None) -> None:
+    """
+    If cfg.stim_preset_infer_from_name is True, infer from csv filename (or provided name_hint),
+    then update cfg.stim_preset and cfg.stim_windows accordingly.
+    """
+    if not cfg.stim_preset_infer_from_name:
+        return
+
+    source = name_hint if name_hint else Path(cfg.csv_path).name
+    inferred = infer_stim_preset_from_string(source)
+
+    # Rebuild preset windows exactly like __post_init__ does
+    presets = {
+        "20s": [(30, 50), (80, 100), (130, 150)],
+        "10s": [(30, 40), (70, 80), (110, 120)],
+        "5s":  [(30, 35), (65, 70), (100, 105)],
+        "none": [],
+    }
+
+    cfg.stim_preset = inferred
+    cfg.stim_windows = presets[cfg.stim_preset]
+
+
+def filter_times_outside_windows(
+    times: np.ndarray,
+    windows: Optional[List[Tuple[float, float]]],
+    pad: float = 0.0
+) -> np.ndarray:
+    """
+    Return times that are NOT inside any [start-pad, end+pad] window.
+    """
+    if times.size == 0 or not windows:
+        return times
+    keep_mask = np.ones(times.shape[0], dtype=bool)
+    for (s, e) in windows:
+        in_win = (times >= (s - pad)) & (times <= (e + pad))
+        keep_mask &= ~in_win
+    return times[keep_mask]
+
 
 def _segments_above_threshold(y: np.ndarray, thr: float) -> List[np.ndarray]:
     above = y > thr
@@ -473,6 +546,9 @@ def detect_spikes_across_rois(
         min_distance_s: Optional[float] = None,
         width_mode: str = "rough",
         width_threshold_s: float = 0.50,
+        stim_windows: Optional[List[Tuple[float, float]]] = None,
+        exclude_spikes_in_windows: bool = False,
+        stim_exclusion_pad_s: float = 0.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, np.ndarray]]:
     t = dff_table[time_col].to_numpy(dtype=float)
 
@@ -504,6 +580,14 @@ def detect_spikes_across_rois(
             accepted_peak_idxs = np.array(sorted(accepted_peak_idxs), dtype=int)
             accepted_peak_idxs = _enforce_min_distance(accepted_peak_idxs, t, min_distance_s)
             peak_times = t[accepted_peak_idxs]
+
+            # Exclude spikes before 10 seconds
+            peak_times = peak_times[peak_times >= 10.0]
+
+            if exclude_spikes_in_windows and stim_windows:
+                peak_times = filter_times_outside_windows(
+                    peak_times, stim_windows, pad=stim_exclusion_pad_s
+                )
         else:
             peak_times = np.array([], dtype=float)
 
@@ -518,6 +602,373 @@ def detect_spikes_across_rois(
         summary_df = summary_df.sort_values("n_spikes", ascending=False).reset_index(drop=True)
     return summary_df, stats_df, spike_times
 
+def _find_roi_col_by_number(columns: Sequence[str], roi_num: int) -> Optional[str]:
+    """
+    Find a column name for ROI number robustly.
+    Matches patterns like 'ROI.005 []', 'ROI.05 []', 'ROI.5 []', 'ROI05', 'ROI5' etc.
+    """
+    # Try strict dotted form first: ROI.<zero-padded> possibly with trailing space + []
+    patt_strict = re.compile(rf"^ROI\.0*{roi_num}\b.*")
+    for c in columns:
+        if patt_strict.match(c):
+            return c
+    # Fallback: plain 'ROI' + digits
+    patt_loose = re.compile(rf"^ROI0*{roi_num}\b.*", re.IGNORECASE)
+    for c in columns:
+        if patt_loose.match(c):
+            return c
+    # Last resort: contains-but-unique
+    candidates = [c for c in columns if re.search(rf"ROI\.?0*{roi_num}\b", c)]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def plot_single_roi_across_experiments(
+    roi_num: int,
+    batch_cfg: BatchConfig,
+    base_cfg: Config,
+    files_filter: Optional[Sequence[str]] = None,  # e.g. ["20s_1.csv", "2mW2.csv"] (filename or stem substrings)
+    y_shift: float = 0.8,
+    linewidth: float = 1.4,
+    show_spikes: bool = True,
+    spike_marker: str = "o",
+    spike_size: int = 28,
+    figsize: Tuple[float, float] = (12, 7),
+    title: Optional[str] = None,
+) -> plt.Figure:
+    """
+    Plot ΔF/F traces for a single ROI across multiple experiments on one y-shifted graph.
+    Uses batch_cfg to discover files and base_cfg to compute ΔF/F and detect spikes.
+
+    Args:
+        roi_num: ROI number (e.g., 5 for ROI05).
+        batch_cfg: your BatchConfig with input_folder and shared settings.
+        base_cfg: a Config instance (will be copied and per-file csv_path set).
+        files_filter: optional list of substrings to keep certain files (match on name or stem).
+        y_shift: vertical offset applied cumulatively between traces.
+        linewidth: line width for traces.
+        show_spikes: overlay spike markers detected with your current thresholds.
+        spike_marker: marker style.
+        spike_size: marker size.
+        figsize: figure size.
+        title: custom title.
+
+    Returns:
+        Matplotlib Figure.
+    """
+    from dataclasses import replace
+
+    files = discover_csv_files(batch_cfg)
+
+    # Apply a simple include-filter by substring on filename or stem
+    if files_filter:
+        keep = []
+        for p in files:
+            name = p.name
+            stem = p.stem
+            if any(s in name or s in stem for s in files_filter):
+                keep.append(p)
+        files = keep
+
+    if not files:
+        raise ValueError("No CSV files found for plotting (after filtering).")
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # palette
+    cmap = plt.get_cmap("tab10")
+    color_cycle = [cmap(i % 10) for i in range(20)]
+
+    # keep track of y shift
+    offset = 0.0
+    plotted_any = False
+
+    for i, csv_path in enumerate(files):
+        # Clone base config and set the path
+        cfg = replace(base_cfg)
+        cfg.csv_path = str(csv_path)
+
+        # Load and compute ΔF/F
+        df = load_fluo_csv(cfg.csv_path, encoding=cfg.encoding, skip_first_row=cfg.skip_first_row)
+        if cfg.time_col not in df.columns:
+            print(f"[WARN] Time column '{cfg.time_col}' not in {csv_path.name}; skipping.")
+            continue
+        t = df[cfg.time_col].to_numpy(dtype=float)
+
+        roi_cols_all = find_roi_columns(df, cfg.roi_key)
+        if not roi_cols_all:
+            print(f"[WARN] No ROI columns in {csv_path.name}; skipping.")
+            continue
+
+        roi_col = _find_roi_col_by_number(roi_cols_all, roi_num)
+        if roi_col is None:
+            print(f"[WARN] ROI {roi_num:02d} not found in {csv_path.name}; skipping.")
+            continue
+
+        # Background vector (interpolated if needed)
+        try:
+            bg_vec = select_background(df, cfg)
+        except Exception as e:
+            print(f"[WARN] Could not select background for {csv_path.name}: {e}; skipping.")
+            continue
+
+        # Compute DFF only for this ROI to save time
+        F_corr = background_subtraction(df[roi_col].to_numpy(dtype=float), bg_vec)
+        dff_vals, _ = dff_percentile_window(
+            F_corr, t,
+            window_half_s=cfg.baseline_window_half_s,
+            percentile=cfg.baseline_percentile,
+        )
+
+        # Plot stim windows behind
+        for s, e in cfg.stim_windows:
+            ax.axvspan(s, e, color=cfg.stim_color, alpha=cfg.stim_alpha, zorder=0)
+
+        # Plot the shifted trace
+        color = color_cycle[i % len(color_cycle)]
+        label = csv_path.stem  # e.g., "20s_1", "2mW2"
+        ax.plot(t, dff_vals + offset, linewidth=linewidth, color=color, label=label)
+
+        # Optionally detect and overlay spikes for THIS ROI
+        if show_spikes:
+            # Run your detector for this file, then pull just this ROI’s peaks
+            dff_table = pd.DataFrame({"Time (s)": t, roi_col: dff_vals})
+            spike_summary_df, spike_stats_df, spike_times = detect_spikes_across_rois(
+                dff_table=dff_table,
+                roi_cols=[roi_col],
+                time_col="Time (s)",
+                baseline_range=(cfg.baseline_index_start, cfg.baseline_index_end),
+                spike_z_sigma=cfg.spike_z_sigma,
+                min_distance_s=cfg.min_spike_distance_s,
+                width_mode=cfg.width_mode,
+                width_threshold_s=cfg.width_threshold_s,
+                stim_windows=cfg.stim_windows,
+                exclude_spikes_in_windows=cfg.exclude_spikes_in_stim,
+                stim_exclusion_pad_s=cfg.stim_exclusion_pad_s,
+            )
+            ptimes = spike_times.get(roi_col, np.array([], dtype=float))
+            if ptimes.size > 0:
+                # Grab y at those times for this ROI to position markers at (dff + offset)
+                # Align times to nearest indices
+                idxs = np.searchsorted(t, ptimes)
+                idxs = np.clip(idxs, 0, len(t)-1)
+                y_sp = dff_vals[idxs] + offset
+                ax.scatter(ptimes, y_sp, s=spike_size, marker=spike_marker,
+                           facecolors="none", edgecolors=color, linewidths=1.2, zorder=5)
+
+        # Increment offset for next experiment
+        offset += y_shift
+        plotted_any = True
+
+    if not plotted_any:
+        raise RuntimeError("No traces were plotted (did the filters exclude everything?).")
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(f"ΔF/F (y-shift={y_shift:g})")
+    ttl = title or f"ROI{roi_num:02d} across experiments (y-shifted)"
+    ax.set_title(ttl, fontweight="bold")
+
+    # optional 0-line only for the first level (visual cue)
+    ax.axhline(0.0, linestyle="--", linewidth=0.8, alpha=0.6)
+
+    ax.legend(ncol=2, fontsize=9)
+    ax.grid(True, axis="x", alpha=0.3, linestyle="--", linewidth=0.6)
+    fig.tight_layout()
+    return fig
+
+def plot_single_roi_across_experiments_flat(
+    roi_num: int,
+    batch_cfg: BatchConfig,
+    base_cfg: Config,
+    files_filter: Optional[Sequence[str]] = None,  # e.g. ["20s_1", "2mW2"]
+    y_step: float = 1.0,
+    linewidth: float = 1.2,
+    show_spikes: bool = True,
+    spike_marker: str = "o",
+    spike_size: int = 26,
+    figsize: Tuple[float, float] = (12, 7),
+    title: Optional[str] = None,
+    out_path: Optional[str] = None,
+
+    # NEW: fixed-scale options
+    use_fixed_scale: bool = False,
+    fixed_min: Optional[float] = None,
+    fixed_max: Optional[float] = None,
+) -> plt.Figure:
+    """
+    Plot one ROI across multiple experiments as horizontally stacked traces.
+    Each experiment appears at a distinct y-level labeled by its experiment name.
+
+    If use_fixed_scale is False (default), each experiment is normalized to its own
+    [min, max] range before being shifted (current behavior).
+
+    If use_fixed_scale is True, all experiments share the same normalization range:
+        - If fixed_min/fixed_max are provided, use those.
+        - Otherwise infer global min/max across all experiments for this ROI.
+    """
+    from dataclasses import replace
+
+    files = discover_csv_files(batch_cfg)
+    if files_filter:
+        files = [p for p in files if any(f in p.name or f in p.stem for f in files_filter)]
+    if not files:
+        raise ValueError("No matching files found!")
+
+    fig, ax = plt.subplots(figsize=figsize)
+    cmap = plt.get_cmap("tab10")
+    color_cycle = [cmap(i % 10) for i in range(20)]
+
+    # --- FIRST PASS: load & compute dFF for each file, gather stats if needed ---
+    traces = []  # each element: dict with keys: csv_path, cfg, t, dff_vals
+    global_min = np.inf
+    global_max = -np.inf
+
+    for csv_path in sorted(files):
+        cfg = replace(base_cfg)
+        cfg.csv_path = str(csv_path)
+
+        df = load_fluo_csv(cfg.csv_path, encoding=cfg.encoding, skip_first_row=cfg.skip_first_row)
+        if cfg.time_col not in df.columns:
+            continue
+
+        t = df[cfg.time_col].to_numpy(dtype=float)
+        roi_cols = find_roi_columns(df, cfg.roi_key)
+        roi_col = _find_roi_col_by_number(roi_cols, roi_num)
+        if roi_col is None:
+            continue
+
+        try:
+            bg_vec = select_background(df, cfg)
+        except Exception as e:
+            print(f"[WARN] Could not select background for {csv_path.name}: {e}; skipping.")
+            continue
+
+        F_corr = background_subtraction(df[roi_col].to_numpy(dtype=float), bg_vec)
+        dff_vals, _ = dff_percentile_window(
+            F_corr, t, cfg.baseline_window_half_s, cfg.baseline_percentile
+        )
+
+        traces.append(
+            {
+                "csv_path": csv_path,
+                "cfg": cfg,
+                "t": t,
+                "roi_col": roi_col,
+                "dff_vals": dff_vals,
+            }
+        )
+
+        # For fixed scale, track global min/max unless user provides explicit limits
+        if use_fixed_scale or (fixed_min is not None or fixed_max is not None):
+            local_min = float(np.nanmin(dff_vals))
+            local_max = float(np.nanmax(dff_vals))
+            global_min = min(global_min, local_min)
+            global_max = max(global_max, local_max)
+
+    if not traces:
+        raise ValueError("No valid traces to plot for this ROI (check filters/ROI number).")
+
+    # Determine normalization range for fixed scale (if requested)
+    if fixed_min is not None or fixed_max is not None:
+        # Use explicit values when provided; fall back to inferred global when missing
+        norm_min = fixed_min if fixed_min is not None else global_min
+        norm_max = fixed_max if fixed_max is not None else global_max
+    else:
+        # Auto from global stats
+        norm_min = global_min
+        norm_max = global_max
+
+    if use_fixed_scale:
+        denom_global = norm_max - norm_min
+        if denom_global <= 0 or not np.isfinite(denom_global):
+            denom_global = 1e-9  # fallback to avoid division by zero
+
+    # --- SECOND PASS: actually plot ---
+    for i, trace in enumerate(traces):
+        csv_path = trace["csv_path"]
+        cfg = trace["cfg"]
+        t = trace["t"]
+        roi_col = trace["roi_col"]
+        dff_vals = trace["dff_vals"]
+
+        # Choose normalization mode
+        if use_fixed_scale:
+            dff_norm = (dff_vals - norm_min) / (denom_global + 1e-9)
+        else:
+            local_min = float(np.nanmin(dff_vals))
+            local_max = float(np.nanmax(dff_vals))
+            denom = local_max - local_min
+            if denom <= 0 or not np.isfinite(denom):
+                denom = 1e-9
+            dff_norm = (dff_vals - local_min) / (denom + 1e-9)
+
+        # Offset by experiment index
+        y_offset = i * y_step
+        color = color_cycle[i % len(color_cycle)]
+
+        # Shade stim windows (behind traces)
+        for s, e in cfg.stim_windows:
+            ax.axvspan(s, e, color=cfg.stim_color, alpha=0.2, zorder=0)
+
+        # Plot normalized, shifted trace
+        ax.plot(t, dff_norm + y_offset, color=color, lw=linewidth, label=None)
+
+        # Optionally detect & overlay spikes
+        if show_spikes:
+            dff_table = pd.DataFrame({"Time (s)": t, roi_col: dff_vals})
+            _, _, spike_times = detect_spikes_across_rois(
+                dff_table=dff_table,
+                roi_cols=[roi_col],
+                time_col="Time (s)",
+                baseline_range=(cfg.baseline_index_start, cfg.baseline_index_end),
+                spike_z_sigma=cfg.spike_z_sigma,
+                min_distance_s=cfg.min_spike_distance_s,
+                width_mode=cfg.width_mode,
+                width_threshold_s=cfg.width_threshold_s,
+                stim_windows=cfg.stim_windows,
+                exclude_spikes_in_windows=cfg.exclude_spikes_in_stim,
+                stim_exclusion_pad_s=cfg.stim_exclusion_pad_s,
+            )
+
+            # Save raw dFF table for this ROI/file (unchanged behavior)
+            out_csv = Path(batch_cfg.output_root) / f"dff_table_ROI{roi_num:02d}_{csv_path.stem}.csv"
+            dff_table.to_csv(out_csv, index=False)
+            print(f"💾 Saved {out_csv}")
+
+            ptimes = spike_times.get(roi_col, np.array([], dtype=float))
+            if ptimes.size:
+                ax.scatter(
+                    ptimes,
+                    np.full_like(ptimes, y_offset),
+                    marker=spike_marker,
+                    s=spike_size,
+                    facecolors="none",
+                    edgecolors=color,
+                    lw=1.2,
+                    zorder=5,
+                )
+
+    # Y-axis labels (one per experiment)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Experiment #")
+    ax.set_yticks(np.arange(len(traces)) * y_step)
+    ax.set_yticklabels([t["csv_path"].stem for t in traces], fontsize=8)
+
+    effective_title = title or f"ROI{roi_num:02d} traces across experiments"
+    if use_fixed_scale:
+        effective_title += f" (fixed scale [{norm_min:.2f}, {norm_max:.2f}])"
+    ax.set_title(effective_title, fontweight="bold")
+
+    ax.grid(True, axis="x", alpha=0.3, linestyle="--", lw=0.5)
+    fig.tight_layout()
+
+    if out_path:
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"✅ Saved to {out_path}")
+
+    return fig
 
 def run(cfg: Config):
     df = load_fluo_csv(cfg.csv_path, encoding=cfg.encoding, skip_first_row=cfg.skip_first_row)
@@ -917,23 +1368,27 @@ def collect_all_spike_timestamps(batch_cfg: BatchConfig) -> pd.DataFrame:
 
 
 def plot_raster(
-        spike_timestamps_df: pd.DataFrame,
-        output_path: Optional[str] = None,
-        figsize: Tuple[float, float] = (12, 8),
-        marker: str = "|",
-        marker_size: int = 100,
-        marker_color: str = "orange",
-        title: str = "Raster Plot: Individual Spike Events per ROI & Condition",
-        xlabel: str = "Condition",
-        ylabel: str = "ROI",
-        show_replicate_labels: bool = True,
-        roi_sort_order: Optional[List[int]] = None,
-        condition_order: Optional[List[str]] = None,
-        highlight_control: bool = True,
-        control_keywords: List[str] = None,
-        highlight_color: str = "lightgreen",
-        highlight_alpha: float = 0.25,
+    spike_timestamps_df: pd.DataFrame,
+    output_path: Optional[str] = None,
+    figsize: Tuple[float, float] = (12, 8),
+    marker: str = "s",            # square
+    marker_size: int = 260,       # bigger
+    marker_color: str = "orange",
+    title: str = "Raster Plot: Individual Spike Events per ROI & Condition",
+    xlabel: str = "Condition",
+    ylabel: str = "ROI",
+    show_replicate_labels: bool = True,
+    roi_sort_order: Optional[List[int]] = None,
+    condition_order: Optional[List[str]] = None,
+    highlight_control: bool = True,
+    control_keywords: List[str] = None,
+    highlight_color: str = "lightgreen",
+    highlight_alpha: float = 0.25,
+    square_edgecolor: str = "k",     # NEW
+    square_edgewidth: float = 0.9,   # NEW
+    tighten_grid: bool = True,       # NEW
 ) -> plt.Figure:
+
     """
     Create a raster plot showing individual spike events.
 
@@ -968,24 +1423,32 @@ def plot_raster(
     if control_keywords is None:
         control_keywords = ["Ctrl", "ctrl", "Control", "control"]
 
-    # Create condition labels (combine Parameter and Replicate)
-    if show_replicate_labels:
-        df["Condition"] = df["Parameter"] + df["Replicate"].astype(str)
-    else:
-        df["Condition"] = df["Parameter"]
+    # ----- Build clean condition labels -----
+    def _rep_str(x):
+        # "" if NA, else integer-like string (1, 2, 3 …)
+        return "" if pd.isna(x) else str(int(x))
 
-    # Determine condition order
-    if condition_order is None:
-        # Auto-order: group by Parameter, then by Replicate
-        conditions = df.groupby(["Parameter", "Replicate"])["Condition"].first().tolist()
+    if show_replicate_labels:
+        df["Condition"] = df["Parameter"].astype(str) + df["Replicate"].apply(_rep_str)
     else:
-        conditions = condition_order
+        df["Condition"] = df["Parameter"].astype(str)
+
+    # ----- Unique, stable condition order -----
+    if condition_order is None:
+        # Drop duplicate (Parameter, Replicate) pairs in FIRST occurrence order
+        cond_df = (
+            df.assign(_rep_clean=df["Replicate"].apply(lambda r: None if pd.isna(r) else int(r)))
+            .drop_duplicates(["Parameter", "_rep_clean"], keep="first")
+        )
+        conditions = cond_df["Condition"].tolist()
+    else:
+        conditions = list(condition_order)
 
     # Determine ROI order
     if roi_sort_order is None:
         roi_list = sorted(df["ROI"].unique())
     else:
-        roi_sort_order = roi_sort_order
+        roi_list = list(roi_sort_order)
 
     # Identify ROIs with spikes in control conditions
     control_rois = set()
@@ -1022,9 +1485,10 @@ def plot_raster(
                 x_pos, y_pos,
                 marker=marker,
                 s=marker_size,
-                color=marker_color,
-                alpha=0.8,
-                linewidths=1.5,
+                facecolors=marker_color,
+                edgecolors=square_edgecolor,
+                linewidths=square_edgewidth,
+                alpha=0.95,
                 zorder=2,
             )
 
@@ -1060,6 +1524,18 @@ def plot_raster(
                   label=f'ROIs with spikes in control (n={len(control_rois)})')
         ]
         ax.legend(handles=legend_elements, loc='upper left', fontsize=9)
+    # Optional: make cells read like a grid
+    if tighten_grid:
+        # make tick lines align with “cells”
+        ax.set_xlim(-0.6, len(conditions) - 0.4)
+        ax.set_ylim(-0.6, len(roi_list) - 0.4)
+        # equal-ish cell feel (doesn't force perfect squares but helps)
+        ax.set_aspect("auto")
+        # stronger grid lines
+        ax.grid(True, which="major", axis="both", alpha=0.35, linestyle="--", linewidth=0.6)
+        # a faint frame
+        for spine in ax.spines.values():
+            spine.set_alpha(0.6)
 
     fig.tight_layout()
 
@@ -1068,7 +1544,96 @@ def plot_raster(
         print(f"Raster plot saved to: {output_path}")
 
     return fig
+from pathlib import Path
 
+def list_all_roi_numbers(
+    batch_cfg: BatchConfig,
+    base_cfg: Config,
+    files_filter: Optional[List[str]] = None,
+    max_files: Optional[int] = None,
+) -> List[int]:
+    """
+    Scan CSVs and return the sorted union of ROI numbers present.
+    """
+    files = discover_csv_files(batch_cfg)
+    if files_filter:
+        files = [p for p in files if any(f in p.name or f in p.stem for f in files_filter)]
+    if max_files is not None:
+        files = files[:max_files]
+
+    roi_nums: set[int] = set()
+    for csv_path in files:
+        try:
+            df = load_fluo_csv(str(csv_path), encoding=base_cfg.encoding, skip_first_row=base_cfg.skip_first_row)
+            roi_cols = find_roi_columns(df, base_cfg.roi_key)
+            for c in roi_cols:
+                n = extract_roi_number(c)
+                if n is not None:
+                    roi_nums.add(n)
+        except Exception as e:
+            print(f"[WARN] Could not inspect {csv_path.name}: {e}")
+            continue
+
+    return sorted(roi_nums)
+
+
+def generate_flat_figs_for_all_rois(
+    batch_cfg: BatchConfig,
+    base_cfg: Config,
+    roi_list: Optional[List[int]] = None,
+    files_filter: Optional[List[str]] = None,
+    out_dir: Optional[str] = None,
+    y_step: float = 1.2,
+    show_spikes: bool = True,
+    linewidth: float = 1.2,
+    figsize: Tuple[float, float] = (12, 7),
+) -> List[Path]:
+    """
+    For each ROI, generate a flat figure (ROI across all experiments) and save it.
+
+    Args:
+        roi_list: if None, auto-discovers all ROI numbers present.
+        files_filter: optional substrings to include certain files only.
+        out_dir: folder to save images. Defaults to '<output_root>/roi_flat'.
+    Returns:
+        List of saved file paths.
+    """
+    save_root = Path(out_dir) if out_dir else Path(batch_cfg.output_root) / "roi_flat"
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    if roi_list is None:
+        roi_list = list_all_roi_numbers(batch_cfg, base_cfg, files_filter=files_filter)
+
+    saved: List[Path] = []
+    for roi_num in roi_list:
+        try:
+            out_path = save_root / f"ROI{roi_num:02d}_flat.png"
+            _ = plot_single_roi_across_experiments_flat(
+                roi_num=roi_num,
+                batch_cfg=batch_cfg,
+                base_cfg=base_cfg,
+                files_filter=files_filter,
+                y_step=y_step,
+                linewidth=linewidth,
+                show_spikes=show_spikes,
+                figsize=figsize,
+                title=f"ROI{roi_num:02d} traces across experiments",
+                out_path=str(out_path),
+                use_fixed_scale=True,
+                fixed_min=0.0,  # optional (else inferred)
+                fixed_max=1.0,
+            )
+            saved.append(out_path)
+            print(f"✅ Saved {out_path}")
+        except Exception as e:
+            print(f"[WARN] Failed for ROI{roi_num:02d}: {e}")
+            continue
+
+    if not saved:
+        print("No ROI flat figures were generated.")
+    else:
+        print(f"\nDone. Generated {len(saved)} ROI flat figures → {save_root}")
+    return saved
 
 def create_raster_plot_from_batch(
         batch_cfg: BatchConfig,
@@ -1118,10 +1683,6 @@ def plot_raster_with_time(
         condition_order: Optional[List[str]] = None,
         color_by_condition: bool = True,
         condition_colors: Optional[Dict[str, str]] = None,
-        highlight_control: bool = True,
-        control_keywords: List[str] = None,
-        highlight_color: str = "lightgreen",
-        highlight_alpha: float = 0.15,
 ) -> plt.Figure:
     """
     Create a raster plot with TIME on X-axis showing when spikes occurred.
@@ -1144,10 +1705,6 @@ def plot_raster_with_time(
         condition_order: Custom condition ordering
         color_by_condition: If True, color spikes by condition
         condition_colors: Dict mapping condition names to colors
-        highlight_control: If True, highlight control condition rows
-        control_keywords: List of keywords to identify control groups
-        highlight_color: Color for highlighting control rows
-        highlight_alpha: Transparency for highlighting
 
     Returns:
         matplotlib Figure object
@@ -1157,10 +1714,6 @@ def plot_raster_with_time(
         return None
 
     df = spike_timestamps_df.copy()
-
-    # Default control keywords
-    if control_keywords is None:
-        control_keywords = ["Ctrl", "ctrl", "Control", "control"]
 
     # Create condition labels
     df["Condition"] = df["Parameter"].astype(str) + df["Replicate"].astype(str)
@@ -1204,27 +1757,12 @@ def plot_raster_with_time(
         y_labels = []
         y_positions = {}
         y_pos = 0
-        control_rows = []
 
         for cond in conditions:
-            # Check if this is a control condition
-            param = df[df["Condition"] == cond]["Parameter"].iloc[0] if cond in df["Condition"].values else ""
-            is_control = any(keyword in param for keyword in control_keywords)
-
             for roi in roi_list:
-                label = f"{cond}-ROI{roi:02d}"
-                if is_control:
-                    label += " ★"
-                    control_rows.append(y_pos)
-                y_labels.append(label)
+                y_labels.append(f"{cond}-ROI{roi:02d}")
                 y_positions[(cond, roi)] = y_pos
                 y_pos += 1
-
-        # Highlight control condition rows
-        if highlight_control and control_rows:
-            for y in control_rows:
-                ax.axhspan(y - 0.4, y + 0.4,
-                           color=highlight_color, alpha=highlight_alpha, zorder=0.5)
     else:
         # ROIs only, spikes from all conditions overlap
         y_labels = [f"ROI{roi:02d}" for roi in roi_list]
@@ -1261,19 +1799,10 @@ def plot_raster_with_time(
     ax.grid(True, axis="x", alpha=0.3, linestyle="--", linewidth=0.5)
 
     # Add legend for conditions if colored by condition
-    legend_elements = []
     if color_by_condition and condition_colors:
         from matplotlib.patches import Patch
         legend_elements = [Patch(facecolor=condition_colors[param], label=param)
                            for param in sorted(condition_colors.keys())]
-
-    # Add control highlight to legend
-    if highlight_control and separate_by_condition and control_rows:
-        from matplotlib.patches import Patch
-        legend_elements.append(Patch(facecolor=highlight_color, alpha=highlight_alpha,
-                                     label=f'Control conditions (★)'))
-
-    if legend_elements:
         ax.legend(handles=legend_elements, loc="upper right", fontsize=9)
 
     # Set limits
@@ -1338,233 +1867,6 @@ def create_both_raster_plots(
     return spike_timestamps_df, fig1, fig2
 
 
-def plot_roi_across_conditions(
-        batch_cfg: BatchConfig,
-        roi_number: int,
-        output_filename: Optional[str] = None,
-        figsize: Tuple[float, float] = (14, 10),
-        stim_windows: Optional[List[Tuple[float, float]]] = None,
-        stim_color: str = "pink",
-        stim_alpha: float = 0.3,
-        show_spikes: bool = True,
-        spike_marker: str = "v",
-        spike_marker_size: int = 80,
-        spike_marker_color: str = "red",
-        condition_colors: Optional[Dict[str, str]] = None,
-        normalize_traces: bool = False,
-) -> plt.Figure:
-    """
-    Plot ΔF/F traces for a specific ROI across all experimental conditions.
-    Each condition gets its own subplot row, aligned by time.
-
-    Args:
-        batch_cfg: BatchConfig object
-        roi_number: ROI number to plot (e.g., 18)
-        output_filename: Filename to save (if None, auto-generates)
-        figsize: Figure size (width, height)
-        stim_windows: List of (start, end) stimulation periods
-        stim_color: Color for stimulation highlighting
-        stim_alpha: Transparency for stimulation
-        show_spikes: If True, mark detected spikes
-        spike_marker: Marker style for spikes
-        spike_marker_size: Size of spike markers
-        spike_marker_color: Color of spike markers
-        condition_colors: Dict mapping condition names to line colors
-        normalize_traces: If True, normalize each trace to [0,1]
-
-    Returns:
-        matplotlib Figure object
-    """
-    output_root = Path(batch_cfg.output_root)
-    roi_column = f"ROI.{roi_number:03d} []"
-
-    # Collect data from all experiment folders
-    condition_data = []
-
-    for subdir in sorted(output_root.iterdir()):
-        if not subdir.is_dir():
-            continue
-
-        # Parse condition info
-        parsed = parse_experiment_filename(subdir.name)
-        if not parsed:
-            continue
-
-        group, replicate = parsed
-        condition_label = f"{group}{replicate}"
-
-        # Find the original CSV to get full ΔF/F trace
-        csv_candidates = list(Path(batch_cfg.input_folder).glob(f"{subdir.name}.*"))
-        if not csv_candidates:
-            continue
-
-        # Load and process this file
-        try:
-            cfg = batch_cfg.shared_config
-            df = load_fluo_csv(str(csv_candidates[0]), cfg.encoding, cfg.skip_first_row)
-
-            if cfg.time_col not in df.columns or roi_column not in df.columns:
-                continue
-
-            time = df[cfg.time_col].to_numpy()
-
-            # Get background and compute ΔF/F for this ROI
-            bg_vec = select_background(df, cfg)
-            F_corr = background_subtraction(df[roi_column].to_numpy(dtype=float), bg_vec)
-            dff_vals, _ = dff_percentile_window(
-                F_corr, time,
-                window_half_s=cfg.baseline_window_half_s,
-                percentile=cfg.baseline_percentile,
-            )
-
-            # Load spike times for this ROI
-            spike_file = subdir / "spike_summary.csv"
-            spike_times = []
-            if spike_file.exists():
-                spike_df = pd.read_csv(spike_file)
-                roi_row = spike_df[spike_df["ROI"] == roi_column]
-                if not roi_row.empty and "spike_times_s" in roi_row.columns:
-                    spike_str = str(roi_row.iloc[0]["spike_times_s"])
-                    if spike_str and spike_str != "nan":
-                        spike_times = [float(t) for t in spike_str.split(";") if t.strip()]
-
-            condition_data.append({
-                "condition": condition_label,
-                "group": group,
-                "replicate": replicate,
-                "time": time,
-                "dff": dff_vals,
-                "spike_times": spike_times,
-            })
-
-        except Exception as e:
-            print(f"Warning: Could not process {subdir.name}: {e}")
-            continue
-
-    if not condition_data:
-        print(f"No data found for ROI {roi_number}")
-        return None
-
-    # Sort by group then replicate
-    condition_data.sort(key=lambda x: (x["group"], x["replicate"]))
-
-    # Create figure with subplots (one per condition)
-    n_conditions = len(condition_data)
-    fig, axes = plt.subplots(n_conditions, 1, figsize=figsize, sharex=True)
-
-    # Handle single condition case
-    if n_conditions == 1:
-        axes = [axes]
-
-    # Set up color map
-    if condition_colors is None:
-        unique_groups = list(set(d["group"] for d in condition_data))
-        cmap = plt.get_cmap("tab10")
-        condition_colors = {grp: cmap(i % 10) for i, grp in enumerate(unique_groups)}
-
-    # Plot each condition
-    for idx, (ax, data) in enumerate(zip(axes, condition_data)):
-        time = data["time"]
-        dff = data["dff"]
-
-        # Normalize if requested
-        if normalize_traces and dff.max() > dff.min():
-            dff = (dff - dff.min()) / (dff.max() - dff.min())
-
-        # Plot stimulation windows
-        if stim_windows:
-            for start, end in stim_windows:
-                ax.axvspan(start, end, color=stim_color, alpha=stim_alpha, zorder=0)
-
-        # Plot ΔF/F trace
-        color = condition_colors.get(data["group"], "black")
-        ax.plot(time, dff, color=color, linewidth=1.5, label=data["condition"])
-
-        # Mark spikes
-        if show_spikes and data["spike_times"]:
-            spike_times_arr = np.array(data["spike_times"])
-            # Interpolate dff values at spike times
-            spike_dff = np.interp(spike_times_arr, time, dff)
-            ax.scatter(spike_times_arr, spike_dff,
-                       marker=spike_marker, s=spike_marker_size,
-                       color=spike_marker_color, edgecolors="black",
-                       linewidths=1, zorder=5, label="Spikes")
-
-        # Styling
-        ax.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
-        ax.set_ylabel(f"{data['condition']}\nΔF/F", fontsize=10)
-        ax.grid(True, alpha=0.3)
-
-        # Add spike count annotation
-        n_spikes = len(data["spike_times"])
-        ax.text(0.98, 0.95, f"n={n_spikes}", transform=ax.transAxes,
-                ha="right", va="top", fontsize=9,
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
-
-    # Set common x-label on bottom subplot
-    axes[-1].set_xlabel("Time (s)", fontsize=12)
-
-    # Overall title
-    fig.suptitle(f"ROI {roi_number:02d} Across Experimental Conditions",
-                 fontsize=14, fontweight="bold", y=0.995)
-
-    fig.tight_layout()
-
-    # Save figure
-    if output_filename is None:
-        output_filename = f"ROI{roi_number:02d}_across_conditions.png"
-
-    output_path = output_root / output_filename
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"ROI comparison plot saved to: {output_path}")
-
-    return fig
-
-
-def plot_multiple_rois_across_conditions(
-        batch_cfg: BatchConfig,
-        roi_numbers: List[int],
-        output_subfolder: str = "roi_comparisons",
-) -> List[plt.Figure]:
-    """
-    Generate comparison plots for multiple ROIs.
-
-    Args:
-        batch_cfg: BatchConfig object
-        roi_numbers: List of ROI numbers to plot
-        output_subfolder: Subfolder name for outputs
-
-    Returns:
-        List of matplotlib Figure objects
-    """
-    output_root = Path(batch_cfg.output_root) / output_subfolder
-    output_root.mkdir(exist_ok=True, parents=True)
-
-    figures = []
-
-    for roi_num in roi_numbers:
-        print(f"Creating comparison plot for ROI {roi_num:02d}...")
-
-        # Create a modified batch_cfg with updated output path
-        from dataclasses import replace
-        temp_batch_cfg = replace(batch_cfg)
-        temp_batch_cfg.output_root = batch_cfg.output_root  # Keep original for data loading
-
-        fig = plot_roi_across_conditions(
-            batch_cfg=batch_cfg,
-            roi_number=roi_num,
-            output_filename=str(output_root / f"ROI{roi_num:02d}_across_conditions.png"),
-            stim_windows=batch_cfg.shared_config.stim_windows,
-        )
-
-        if fig:
-            figures.append(fig)
-            plt.close(fig)
-
-    print(f"\nROI comparison plots saved to: {output_root}/")
-    return figures
-
-
 if __name__ == "__main__":
 
     single_file_mode = False
@@ -1607,28 +1909,29 @@ if __name__ == "__main__":
             time_col="Axis [s]",
             roi_key="ROI",
             bg_source="roi_column",
-            bg_column_name="ROI.000 []",
+            bg_column_name="ROI.01 []",
             exclude_bg_roi_from_plot=True,
             exclude_bg_roi_from_detection=True,
             baseline_window_half_s=30.0,
             baseline_percentile=8.0,
             stim_preset="20s",
-            baseline_index_start=5,
-            baseline_index_end=25,
+            baseline_index_start=10,
+            baseline_index_end=30,
             spike_z_sigma=3.0,
-            min_spike_distance_s=10,
+            min_spike_distance_s=15,
             width_mode="rough",
-            width_threshold_s=2.0,
-            use_auto_ylim=True,
+            width_threshold_s=4.0,
+            use_auto_ylim=False,
             show_spike_markers=True,
             show_spiking_only_figure=True,
             out_fig=None,
             out_spike_csv=None,
             out_spike_stats_csv=None,
+
         )
 
         batch_cfg = BatchConfig(
-            input_folder="./0806",
+            input_folder="./1222",
             file_pattern="*.csv",
             output_root="./batch_results",
             shared_config=shared_config,
@@ -1661,3 +1964,360 @@ if __name__ == "__main__":
         print(f"Raster plot (grouped): {batch_cfg.output_root}/spike_raster_grouped.png")
         print(f"Raster plot (timeline): {batch_cfg.output_root}/spike_raster_timeline.png")
         print(f"All spike timestamps: {batch_cfg.output_root}/all_spike_timestamps.csv")
+
+
+
+        # fig = plot_single_roi_across_experiments_flat(
+        #     roi_num=3,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2","20-2"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI03_flat.png",
+        # )
+        #
+        # fig2 = plot_single_roi_across_experiments_flat(
+        #     roi_num=5,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-1","20-2"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI05_flat.png",
+        # )
+        #
+        # fig3 = plot_single_roi_across_experiments_flat(
+        #     roi_num=8,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-3","2hz1","2hz3","5hz1","5hz3"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI08_flat.png",
+        # )
+        #
+        # fig4 = plot_single_roi_across_experiments_flat(
+        #     roi_num=9,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-3","2hz1","2hz3","5hz2","20-2"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI09_flat.png",
+        # )
+        #
+        # fig5 = plot_single_roi_across_experiments_flat(
+        #     roi_num=10,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-1", "5hz1", "5hz2", "5hz3", "20-2"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI10_flat.png",
+        # )
+        #
+        # fig6 = plot_single_roi_across_experiments_flat(
+        #     roi_num=12,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-2", "2hz1", "2hz2", "5hz1", "20-1"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI12_flat.png",
+        # )
+        #
+        # fig7 = plot_single_roi_across_experiments_flat(
+        #     roi_num=13,
+        #     batch_cfg=batch_cfg,
+        #     base_cfg=shared_config,
+        #     files_filter=["Ctrl1", "Ctrl2", "20-2", "2hz1", "2hz2", "20-1"],
+        #     y_step=1.2,
+        #     show_spikes=True,
+        #     out_path="batch_results/ROI13_flat.png",
+        # )
+
+
+        _ = generate_flat_figs_for_all_rois(
+            batch_cfg=batch_cfg,
+            base_cfg=shared_config,
+            roi_list=None,  # auto-discover all ROI numbers
+            files_filter=None,  # or e.g. ["Ctrl", "10-1"] to subset
+            out_dir="batch_results/roi_flat",
+            y_step=1.2,
+            show_spikes=True,
+            linewidth=1.2,
+            figsize=(12, 7),
+        )
+
+# ==========================================
+# GUI AND EXECUTION LOGIC
+# ==========================================
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk  # Requires: pip install pillow
+import os
+
+
+
+# --- 1. The "Glue" Logic ---
+# This function connects your library functions together to process one file
+def run_single_file_pipeline(file_path: Path, config: Config) -> str:
+    """
+    Runs the loading, dFF, spike detection, and plotting for one file.
+    Returns the path to the saved plot image.
+    """
+    # 1. Update Config path
+    config.csv_path = str(file_path)
+
+    # 2. Auto-infer stim preset if enabled
+    if config.stim_preset_infer_from_name:
+        apply_inferred_stim_preset(config, name_hint=file_path.name)
+
+    # 3. Load Data
+    df = load_fluo_csv(config.csv_path, config.encoding, config.skip_first_row)
+
+    # 4. Identify Columns
+    roi_cols = find_roi_columns(df, config.roi_key)
+    if not roi_cols:
+        raise ValueError(f"No ROI columns found in {file_path.name}")
+
+    # 5. Background Subtraction
+    bg_vec = select_background(df, config)
+    t = df[config.time_col].to_numpy(dtype=float)
+
+    # 6. Compute DFF
+    dff_df = compute_all_dff(df, roi_cols, bg_vec, t, config)
+
+    # 7. Spike Detection
+    # Note: Using your detect_spikes_across_rois function
+    _, _, spike_times = detect_spikes_across_rois(
+        dff_table=dff_df,
+        roi_cols=roi_cols,
+        time_col="Time (s)",
+        spike_z_sigma=config.spike_z_sigma,
+        width_mode=config.width_mode,
+        width_threshold_s=config.width_threshold_s,
+        stim_windows=config.stim_windows,
+        exclude_spikes_in_windows=config.exclude_spikes_in_stim
+    )
+
+    # 8. Plotting
+    # We check if background was an ROI to handle exclusion logic
+    bg_was_roi = (config.bg_source == "roi_column")
+
+    fig = plot_dff(dff_df, roi_cols, config, bg_was_roi, spike_times)
+
+    # 9. Save Image
+    output_filename = f"Delta_F_plot_{file_path.stem}.png"
+    output_path = file_path.parent / output_filename
+    fig.savefig(output_path, dpi=100)
+    plt.close(fig)  # Close to free memory
+
+    return str(output_path)
+
+
+# --- 2. The GUI Class ---
+
+class AnalysisGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Calcium Imaging Analysis Tool")
+        self.root.geometry("1100x850")
+
+        self.file_paths = []
+        self.generated_images = []
+
+        # --- Layout Containers ---
+        # Top: Settings & Files (Horizontal Split)
+        # Bottom: Grid Preview
+
+        main_pane = tk.PanedWindow(root, orient=tk.VERTICAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        top_frame = tk.Frame(main_pane)
+        main_pane.add(top_frame, height=350)
+
+        # Left: File Manager
+        left_frame = tk.LabelFrame(top_frame, text="1. Load Files", padx=10, pady=10)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.btn_add = tk.Button(left_frame, text="Add CSV Files", command=self.add_files, bg="#e1e1e1")
+        self.btn_add.pack(fill=tk.X, pady=5)
+
+        self.btn_clear = tk.Button(left_frame, text="Clear List", command=self.clear_files)
+        self.btn_clear.pack(fill=tk.X, pady=2)
+
+        self.listbox = tk.Listbox(left_frame, selectmode=tk.EXTENDED)
+        self.listbox.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Right: Settings
+        right_frame = tk.LabelFrame(top_frame, text="2. Settings", padx=10, pady=10)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, ipadx=10)
+
+        # -- Settings Fields --
+        self.entries = {}
+        self.create_setting_entry(right_frame, "Stim Preset (20s/10s/5s/custom)", "20s")
+        self.create_setting_entry(right_frame, "Infer Preset from Name (True/False)", "True")
+        self.create_setting_entry(right_frame, "Sigma (Spike Threshold)", "5.0")
+        self.create_setting_entry(right_frame, "Baseline Window (s)", "15.0")
+        self.create_setting_entry(right_frame, "ROI Key (e.g., ROI)", "ROI")
+        self.create_setting_entry(right_frame, "BG Column (e.g., ROI.01 [])", "ROI.01 []")
+
+        # Run Button
+        self.btn_run = tk.Button(right_frame, text="RUN ANALYSIS", command=self.run_analysis,
+                                 bg="green", fg="white", font=("Arial", 12, "bold"))
+        self.btn_run.pack(side=tk.BOTTOM, fill=tk.X, pady=20)
+
+        # --- Bottom: Image Grid ---
+        bottom_frame = tk.LabelFrame(main_pane, text="3. Preview (Last 25 Traces)", padx=10, pady=10)
+        main_pane.add(bottom_frame)
+
+        # Canvas for the grid (to center it)
+        self.grid_frame = tk.Frame(bottom_frame)
+        self.grid_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Create 5x5 Matrix of Labels
+        self.image_slots = []
+        for r in range(5):
+            for c in range(5):
+                lbl = tk.Label(self.grid_frame, text=".", relief=tk.RIDGE, bg="#f0f0f0", width=20, height=10)
+                lbl.grid(row=r, column=c, padx=2, pady=2, sticky="nsew")
+                self.image_slots.append(lbl)
+
+        # Configure grid weights
+        for i in range(5):
+            self.grid_frame.columnconfigure(i, weight=1)
+            self.grid_frame.rowconfigure(i, weight=1)
+
+    def create_setting_entry(self, parent, label_text, default_val):
+        frame = tk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+        lbl = tk.Label(frame, text=label_text, width=30, anchor="w")
+        lbl.pack(side=tk.LEFT)
+        entry = tk.Entry(frame)
+        entry.insert(0, str(default_val))
+        entry.pack(side=tk.RIGHT, expand=True, fill=tk.X)
+        self.entries[label_text] = entry
+
+    def add_files(self):
+        files = filedialog.askopenfilenames(filetypes=[("CSV Files", "*.csv")])
+        for f in files:
+            if f not in self.file_paths:
+                self.file_paths.append(f)
+                self.listbox.insert(tk.END, os.path.basename(f))
+
+    def clear_files(self):
+        self.file_paths = []
+        self.listbox.delete(0, tk.END)
+
+    def get_config_from_ui(self):
+        # Create a default config
+        cfg = Config()
+
+        # Override with UI values
+        try:
+            cfg.stim_preset = self.entries["Stim Preset (20s/10s/5s/custom)"].get()
+
+            infer_val = self.entries["Infer Preset from Name (True/False)"].get().lower()
+            cfg.stim_preset_infer_from_name = (infer_val == 'true')
+
+            cfg.spike_z_sigma = float(self.entries["Sigma (Spike Threshold)"].get())
+            cfg.baseline_window_half_s = float(self.entries["Baseline Window (s)"].get())
+            cfg.roi_key = self.entries["ROI Key (e.g., ROI)"].get()
+            cfg.bg_column_name = self.entries["BG Column (e.g., ROI.01 [])"].get()
+
+            # Re-init logic to handle presets logic (calling __post_init__ manually if needed,
+            # but since we are modifying dataclass after init, we might need to manually set windows)
+            # The cleanest way is to re-run the logic from __post_init__ here:
+            presets = {
+                "20s": [(30, 50), (80, 100), (130, 150)],
+                "10s": [(30, 40), (70, 80), (110, 120)],
+                "5s": [(30, 35), (65, 70), (100, 105)],
+                "none": [],
+            }
+            if cfg.stim_preset in presets:
+                cfg.stim_windows = presets[cfg.stim_preset]
+
+        except ValueError as e:
+            messagebox.showerror("Config Error", f"Invalid input in settings: {e}")
+            return None
+        return cfg
+
+    def run_analysis(self):
+        if not self.file_paths:
+            messagebox.showwarning("No Files", "Please add CSV files first.")
+            return
+
+        cfg = self.get_config_from_ui()
+        if not cfg:
+            return
+
+        self.generated_images = []
+
+        # Reset grid visual
+        for lbl in self.image_slots:
+            lbl.config(image='', text="Processing...", bg="#e1e1e1")
+
+        self.root.update()
+
+        # Run Loop
+        try:
+            for i, f_path in enumerate(self.file_paths):
+                # Update UI status
+                if i < 25:
+                    self.image_slots[i].config(text=f"Running...\n{os.path.basename(f_path)}")
+                    self.root.update()
+
+                path_obj = Path(f_path)
+                out_img = run_single_file_pipeline(path_obj, cfg)
+                self.generated_images.append(out_img)
+
+            self.update_grid()
+            messagebox.showinfo("Done", f"Processed {len(self.file_paths)} files successfully.")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+
+    def update_grid(self):
+        # We only show the first 25 images to fit the 5x5 grid
+        to_show = self.generated_images[:25]
+
+        for i, img_path in enumerate(to_show):
+            try:
+                # Load and Resize Image
+                pil_img = Image.open(img_path)
+
+                # Resize keeping aspect ratio roughly
+                pil_img.thumbnail((200, 150))
+
+                tk_img = ImageTk.PhotoImage(pil_img)
+
+                lbl = self.image_slots[i]
+                lbl.config(image=tk_img, text="", bg="white")
+                lbl.image = tk_img  # Keep reference!
+
+            except Exception as e:
+                print(f"Failed to load image {img_path}: {e}")
+
+        # Clear unused slots
+        for i in range(len(to_show), 25):
+            self.image_slots[i].config(image='', text="Empty", bg="#f0f0f0")
+
+
+# --- 3. Main Entry Point ---
+
+if __name__ == "__main__":
+    # Check for Pillow
+    try:
+        import PIL
+    except ImportError:
+        print("Please install Pillow: pip install pillow")
+        exit()
+
+    root = tk.Tk()
+    app = AnalysisGUI(root)
+    root.mainloop()
