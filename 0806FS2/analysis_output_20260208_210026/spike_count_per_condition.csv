@@ -1,0 +1,15 @@
+condition,spike_count,condition_group
+10s2,1,10s
+20s1,3,20s
+20s3,1,20s
+20s4,2,20s
+20s6,1,20s
+2Hz1,2,2Hz
+2Hz5,1,2Hz
+2mW2,2,2mW
+5Hz2,1,5Hz
+5s1,2,5s
+5s2,2,5s
+5s6,1,5s
+Ctrl1,1,Ctrl
+Ctrl2,2,Ctrl

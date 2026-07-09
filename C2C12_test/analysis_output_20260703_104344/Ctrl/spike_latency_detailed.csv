@@ -1,0 +1,6 @@
+ROI,spike_time_s,latency_s,stim_window_start_s,stim_window_end_s
+Channel.001/ROI.04 [],195.829,0.0,192.0,198.0
+Channel.001/ROI.06 [],124.403,58.403000000000006,60.0,66.0
+Channel.001/ROI.06 [],193.854,0.0,192.0,198.0
+Channel.001/ROI.07 [],123.929,57.929,60.0,66.0
+Channel.001/ROI.07 [],195.362,0.0,192.0,198.0

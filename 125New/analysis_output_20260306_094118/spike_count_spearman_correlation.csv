@@ -1,0 +1,2 @@
+Condition_A,Condition_B,n_ROIs,Spearman_rho,p_value,Significance
+blue,red,4,0.8333333333333335,0.1666666666666665,ns

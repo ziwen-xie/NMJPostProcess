@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(dir:*)",
+      "Bash(winget install:*)",
+      "Bash(ls 0806sub2/*.csv)",
+      "Bash(git stash)",
+      "Bash(git stash pop)",
+      "Bash(ls /c/Users/jerse/PycharmProjects/NMJPostProcess/125New/*.csv)"
+    ]
+  }
+}

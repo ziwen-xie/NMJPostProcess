@@ -1,0 +1,3 @@
+condition_group,total_spikes,n_replicates,mean_spikes,std_spikes
+blue,25,4,6.25,5.188127472091128
+red,26,3,8.666666666666666,3.214550253664318

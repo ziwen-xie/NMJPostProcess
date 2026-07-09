@@ -35,6 +35,7 @@ class Config:
     # Background options
     bg_source: str = "roi_column"
     bg_column_name: str = "ROI.01 []"
+    bg_column_auto_detect: bool = True  # if True, guess the background ROI column from the CSV header
     bg_csv_path: str = "./0718/bg.csv"
     bg_csv_col_name: Optional[str] = None
 
@@ -176,12 +177,41 @@ def find_roi_columns(df: pd.DataFrame, roi_key: str) -> List[str]:
     return [c for c in df.columns if roi_key in c]
 
 
+def detect_bg_column(df: pd.DataFrame, roi_key: str = "ROI") -> Optional[str]:
+    """
+    Guess the background/reference ROI column from a fluorescence CSV.
+
+    By convention the background channel is the lowest-numbered ROI column
+    (e.g. 'ROI.00 []' or 'ROI.01 []', depending on whether the acquisition
+    software indexes from 0 or 1). Returns None if no ROI columns are found.
+    """
+    roi_cols = find_roi_columns(df, roi_key)
+    if not roi_cols:
+        return None
+
+    def _index_of(col: str) -> Optional[int]:
+        after_key = col.split(roi_key, 1)[-1]
+        m = re.search(r"\d+", after_key)
+        return int(m.group()) if m else None
+
+    indexed = [(c, _index_of(c)) for c in roi_cols]
+    indexed = [(c, i) for c, i in indexed if i is not None]
+    if not indexed:
+        return roi_cols[0]
+    indexed.sort(key=lambda ci: ci[1])
+    return indexed[0][0]
+
+
 def select_background(df_main: pd.DataFrame, cfg: Config) -> np.ndarray:
     if cfg.time_col not in df_main.columns:
         raise ValueError(f"Time column '{cfg.time_col}' not found in main CSV.")
     t_main = df_main[cfg.time_col].to_numpy()
 
     if cfg.bg_source == "roi_column":
+        if cfg.bg_column_auto_detect:
+            detected = detect_bg_column(df_main, cfg.roi_key)
+            if detected is not None:
+                cfg.bg_column_name = detected
         if cfg.bg_column_name not in df_main.columns:
             raise ValueError(
                 f"Background column '{cfg.bg_column_name}' not found in main CSV.\n"
@@ -506,6 +536,30 @@ def infer_stim_preset_from_string(s: str) -> str:
     if "5s" in s_low:
         return "5s"
     return "20s"
+
+def generate_stim_windows(
+    n_stims: int,
+    baseline_s: float,
+    stim_duration_s: float,
+    rest_s: float,
+) -> List[Tuple[float, float]]:
+    """
+    Build a regularly-spaced list of (start, end) stimulation windows.
+
+    baseline_s is the quiet period before the first window starts; each
+    subsequent window starts *rest_s* seconds after the previous one ends.
+    E.g. n_stims=3, baseline_s=30, stim_duration_s=20, rest_s=30 reproduces
+    the built-in "20s" preset: [(30,50), (80,100), (130,150)].
+    """
+    windows = []
+    t = float(baseline_s)
+    for _ in range(int(n_stims)):
+        start = t
+        end = start + float(stim_duration_s)
+        windows.append((start, end))
+        t = end + float(rest_s)
+    return windows
+
 
 def apply_inferred_stim_preset(cfg: Config, name_hint: Optional[str] = None) -> None:
     """
@@ -2629,6 +2683,7 @@ def _load_condition_data(
     analysis_output_folder: str,
     selected_conditions: Optional[List[str]] = None,
     stim_preset_mode: str = "auto",
+    custom_stim_windows: Optional[List[Tuple[float, float]]] = None,
 ) -> Dict:
     """Load ΔF/F data and spike info from analysis output subfolders."""
     import pandas as pd
@@ -2652,12 +2707,14 @@ def _load_condition_data(
         "5s": [(30, 35), (65, 70), (100, 105)],
         "none": [],
     }
-    valid_stim_modes = {"auto", *presets.keys()}
+    valid_stim_modes = {"auto", "custom", *presets.keys()}
     if stim_preset_mode not in valid_stim_modes:
         raise ValueError(
             f"Invalid stim_preset_mode='{stim_preset_mode}'. "
             f"Expected one of: {sorted(valid_stim_modes)}"
         )
+    if stim_preset_mode == "custom" and not custom_stim_windows:
+        raise ValueError("stim_preset_mode='custom' requires custom_stim_windows to be provided.")
 
     condition_data = {}
     all_roi_names = set()
@@ -2686,16 +2743,21 @@ def _load_condition_data(
                             times = [float(t.strip()) for t in times_str.split(";") if t.strip()]
                             spike_times_dict[roi_name] = np.array(times)
 
-            if stim_preset_mode == "auto":
+            if stim_preset_mode == "custom":
+                stim_preset = "custom"
+                stim_windows = list(custom_stim_windows)
+            elif stim_preset_mode == "auto":
                 stim_preset = infer_stim_preset_from_string(condition_name)
+                stim_windows = presets.get(stim_preset, [])
             else:
                 stim_preset = stim_preset_mode
+                stim_windows = presets.get(stim_preset, [])
 
             condition_data[condition_name] = {
                 "dff_df": dff_df,
                 "spike_times": spike_times_dict,
                 "stim_preset": stim_preset,
-                "stim_windows": presets.get(stim_preset, []),
+                "stim_windows": stim_windows,
             }
             print(
                 f"[OK] {condition_name}: {len(roi_cols)} ROIs, "
@@ -2724,7 +2786,10 @@ def plot_multi_roi_traces_svg(
     condition_offset: str = "none",   # "none", "auto", "manual"
     manual_offset_value: float = 0.5,
     label_right_margin: float = 0.10,
-    stim_preset_mode: str = "auto",   # "auto", "20s", "10s", "5s", "none"
+    stim_preset_mode: str = "auto",   # "auto", "20s", "10s", "5s", "none", "custom"
+    custom_stim_windows: Optional[List[Tuple[float, float]]] = None,
+    stim_color: str = "#ff0000",
+    stim_alpha: float = 0.15,
 ) -> str:
     """
     Plot ΔF/F traces from multiple conditions/ROIs to SVG with
@@ -2755,7 +2820,15 @@ def plot_multi_roi_traces_svg(
         (0.06 = 6 %).
     stim_preset_mode : str
         "auto" infers per condition from folder/file name (e.g., 5s1, 10s2),
-        otherwise force one preset for all conditions ("20s", "10s", "5s", "none").
+        otherwise force one preset for all conditions ("20s", "10s", "5s", "none"),
+        or "custom" to use *custom_stim_windows* for every condition.
+    custom_stim_windows : Optional[List[Tuple[float,float]]]
+        Explicit (start, end) windows in seconds, used when stim_preset_mode="custom".
+        See generate_stim_windows() to build a regularly-spaced list.
+    stim_color : str
+        Fill/edge color for the stimulation-window shading.
+    stim_alpha : float
+        Fill opacity for the stimulation-window shading.
 
     Returns
     -------
@@ -2772,7 +2845,8 @@ def plot_multi_roi_traces_svg(
     print(f"{'='*60}\n")
 
     condition_data, all_roi_names = _load_condition_data(
-        analysis_output_folder, selected_conditions, stim_preset_mode=stim_preset_mode
+        analysis_output_folder, selected_conditions, stim_preset_mode=stim_preset_mode,
+        custom_stim_windows=custom_stim_windows,
     )
 
     if selected_rois:
@@ -2894,9 +2968,9 @@ def plot_multi_roi_traces_svg(
                         (float(s), y_lo - pad),
                         float(e) - float(s),
                         (y_hi - y_lo) + 2 * pad,
-                        facecolor="#ffcccc",
-                        alpha=0.45,
-                        edgecolor="red",
+                        facecolor=stim_color,
+                        alpha=stim_alpha,
+                        edgecolor=stim_color,
                         linewidth=0.5,
                         zorder=0,
                     )
@@ -3489,6 +3563,9 @@ def generate_interactive_html(
     stim_preset_mode: str = "auto",
     condition_offset: str = "auto",
     manual_offset_value: float = 0.5,
+    custom_stim_windows: Optional[List[Tuple[float, float]]] = None,
+    stim_color: str = "red",
+    stim_opacity: float = 0.08,
 ) -> str:
     """
     Generate a standalone interactive HTML file with Plotly traces.
@@ -3501,6 +3578,12 @@ def generate_interactive_html(
         "manual" - use manual_offset_value between conditions.
     manual_offset_value : float
         Vertical shift between conditions when condition_offset="manual".
+    custom_stim_windows : Optional[List[Tuple[float,float]]]
+        Explicit (start, end) windows in seconds, used when stim_preset_mode="custom".
+    stim_color : str
+        Fill/edge color for the stimulation-window shading.
+    stim_opacity : float
+        Fill opacity for the stimulation-window shading.
 
     Returns the path to the saved HTML file.
     """
@@ -3511,6 +3594,7 @@ def generate_interactive_html(
         analysis_output_folder,
         selected_conditions=selected_conditions,
         stim_preset_mode=stim_preset_mode,
+        custom_stim_windows=custom_stim_windows,
     )
 
     if selected_rois:
@@ -3625,8 +3709,8 @@ def generate_interactive_html(
                         drawn_windows.add(key)
                         fig.add_vrect(
                             x0=s, x1=e,
-                            fillcolor="red", opacity=0.08,
-                            line_width=0.5, line_color="red",
+                            fillcolor=stim_color, opacity=stim_opacity,
+                            line_width=0.5, line_color=stim_color,
                             row=row, col=1,
                         )
 

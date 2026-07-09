@@ -1,0 +1,6 @@
+Condition_A,Condition_B,n_ROIs,Spearman_rho,p_value,Significance
+10s,20s,3,,,ns
+10s,5hz,3,,,ns
+20s,2hz,3,0.8660254037844387,0.3333333333333332,ns
+20s,5hz,15,0.0,1.0,ns
+2hz,5hz,5,-0.9128709291752769,0.03046629166217096,*

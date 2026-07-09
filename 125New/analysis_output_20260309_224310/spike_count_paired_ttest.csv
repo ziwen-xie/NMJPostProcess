@@ -1,0 +1,2 @@
+Group_A,Group_B,n_paired_ROIs,Mean_A,Mean_B,Mean_Diff,t_statistic,p_value,Cohens_d,Significance
+blue,red,5,2.2,1.6,0.6,1.2304546686443938,0.28593863042786194,0.5502760564641687,ns

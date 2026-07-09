@@ -1,0 +1,11 @@
+filename,group,replicate,n_rois,n_spiking_rois,total_spikes,status,error
+blue1.csv,blue,1.0,3,3,9,success,
+blue2.csv,blue,2.0,3,3,9,success,
+blue3.csv,blue,3.0,3,3,9,success,
+blue4.csv,blue,4.0,3,3,12,success,
+Ctrl1.csv,Ctrl,1.0,0,0,0,success,
+Ctrl2_blue.csv,Ctrl2_blue.csv,,3,3,9,success,
+Ctrl2_red.csv,Ctrl2_red.csv,,1,1,1,success,
+red1.csv,red,1.0,1,1,1,success,
+red2.csv,red,2.0,1,1,3,success,
+red3.csv,red,3.0,1,1,3,success,

@@ -1,0 +1,3 @@
+ROI,spike_time_s,latency_s,stim_window_start_s,stim_window_end_s
+ROI.01 [],97.777,17.777,70,80
+ROI.06 [],56.276,16.276000000000003,30,40

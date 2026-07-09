@@ -1,0 +1,3 @@
+ROI,n_spikes,spike_times_s
+Channel.001/ROI.06 [],3,55.378;124.403;193.854
+Channel.001/ROI.07 [],2,57.376;195.362

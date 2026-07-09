@@ -1,0 +1,4 @@
+Group_A,Group_B,n_A,n_B,Mean_A,Mean_B,p_value,Significance
+Ctrl,blue,1,4,3.0,7.25,1.0,ns
+Ctrl,red,1,8,3.0,11.5,1.0,ns
+blue,red,4,8,7.25,11.5,0.49539441548482366,ns

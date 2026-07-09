@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsSimpleTextItem,
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView,
+    QAbstractItemView, QColorDialog, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QRunnable, QThreadPool, QRectF, QPointF, QEvent
 from PyQt6.QtGui import QPixmap, QColor, QPainter, QImage, QPen, QBrush, QFont
@@ -481,8 +481,12 @@ class SettingsPage(QWidget):
             cfg['infer_name'] = b['infer_name'].isChecked()
             cfg['sigma'] = b['sigma'].value()
             cfg['bg_col'] = b['bg_col'].text()
+            cfg['bg_col_auto'] = b['bg_col_auto'].isChecked()
             cfg['auto_ylim'] = b['auto_ylim'].isChecked()
             cfg['ylim_max'] = b['ylim_max'].value()
+            cfg['custom_stim_windows'] = self.batch_ref.custom_stim_windows
+            cfg['custom_stim_color'] = self.batch_ref.custom_stim_color
+            cfg['custom_stim_alpha'] = self.batch_ref.custom_stim_alpha
 
         return cfg
 
@@ -540,10 +544,22 @@ class SettingsPage(QWidget):
                 b['sigma'].setValue(cfg['sigma'])
             if 'bg_col' in cfg:
                 b['bg_col'].setText(cfg['bg_col'])
+            if 'bg_col_auto' in cfg:
+                b['bg_col_auto'].setChecked(cfg['bg_col_auto'])
             if 'auto_ylim' in cfg:
                 b['auto_ylim'].setChecked(cfg['auto_ylim'])
             if 'ylim_max' in cfg:
                 b['ylim_max'].setValue(cfg['ylim_max'])
+            if cfg.get('custom_stim_windows'):
+                self.batch_ref.custom_stim_windows = [tuple(w) for w in cfg['custom_stim_windows']]
+                self.batch_ref.custom_stim_color = cfg.get('custom_stim_color', 'red')
+                self.batch_ref.custom_stim_alpha = cfg.get('custom_stim_alpha', 0.30)
+                windows = self.batch_ref.custom_stim_windows
+                self.batch_ref.lbl_stim_custom_status.setText(
+                    f"{len(windows)} window(s): " +
+                    ", ".join(f"[{s:.1f}-{e:.1f}]" for s, e in windows[:4]) +
+                    (" ..." if len(windows) > 4 else ""))
+                self.batch_ref.lbl_stim_custom_status.setStyleSheet("color: #5fd75f; font-size: 10px;")
 
     def save_config(self):
         """Save current configuration to a JSON file."""
@@ -596,6 +612,9 @@ class BatchAnalysisPage(QWidget):
         self.processed_count = 0
         self.result_cards = []  # List of ResultCard widgets
         self.popups = []
+        self.custom_stim_windows = None
+        self.custom_stim_color = "red"
+        self.custom_stim_alpha = 0.30
 
         self.setup_ui()
 
@@ -656,6 +675,10 @@ class BatchAnalysisPage(QWidget):
         self.inputs['sigma'].setValue(5.0)
 
         self.inputs['bg_col'] = QLineEdit("ROI.01 []")
+        self.inputs['bg_col_auto'] = QCheckBox("Auto-detect BG Column (lowest-numbered ROI)")
+        self.inputs['bg_col_auto'].setChecked(True)
+        self.inputs['bg_col_auto'].toggled.connect(lambda checked: self.inputs['bg_col'].setEnabled(not checked))
+        self.inputs['bg_col'].setEnabled(False)
 
         self.inputs['auto_ylim'] = QCheckBox("Use Auto Y-Limits")
         self.inputs['auto_ylim'].setChecked(True)  # Changed default to True
@@ -666,8 +689,16 @@ class BatchAnalysisPage(QWidget):
         self.inputs['ylim_max'].setValue(0.3)
         self.inputs['ylim_max'].setSingleStep(0.1)
 
+        self.btn_design_stim = QPushButton("Design Stim Windows...")
+        self.btn_design_stim.clicked.connect(self._open_stim_designer)
+        self.lbl_stim_custom_status = QLabel("")
+        self.lbl_stim_custom_status.setStyleSheet("color: #aaa; font-size: 10px;")
+        self.lbl_stim_custom_status.setWordWrap(True)
+
         form.addRow("Stim Preset:", self.inputs['preset'])
         form.addRow("", self.inputs['infer_name'])
+        form.addRow("", self.btn_design_stim)
+        form.addRow("", self.lbl_stim_custom_status)
         form.addRow("Spike Sigma:", self.inputs['sigma'])
 
         line = QFrame()
@@ -675,6 +706,7 @@ class BatchAnalysisPage(QWidget):
         line.setStyleSheet("color: #444;")
         form.addRow(line)
 
+        form.addRow("", self.inputs['bg_col_auto'])
         form.addRow("BG Column:", self.inputs['bg_col'])
         form.addRow("", self.inputs['auto_ylim'])
         form.addRow("Max Y-Limit:", self.inputs['ylim_max'])
@@ -732,6 +764,34 @@ class BatchAnalysisPage(QWidget):
     def toggle_ylim(self, checked):
         self.inputs['ylim_max'].setEnabled(not checked)
 
+    def _open_stim_designer(self):
+        dlg = StimWindowDesignerDialog(
+            self,
+            windows=self.custom_stim_windows,
+            color=self.custom_stim_color,
+            alpha=self.custom_stim_alpha,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            try:
+                windows = dlg.get_windows()
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid Windows", str(e))
+                return
+            self.custom_stim_windows = windows
+            self.custom_stim_color = dlg.get_color()
+            self.custom_stim_alpha = dlg.get_alpha()
+            if windows:
+                # Designing custom windows overrides the preset text/inference
+                self.inputs['preset'].setText("custom")
+                self.inputs['infer_name'].setChecked(False)
+                self.lbl_stim_custom_status.setText(
+                    f"{len(windows)} window(s): " +
+                    ", ".join(f"[{s:.1f}-{e:.1f}]" for s, e in windows[:4]) +
+                    (" ..." if len(windows) > 4 else ""))
+                self.lbl_stim_custom_status.setStyleSheet("color: #5fd75f; font-size: 10px;")
+            else:
+                self.lbl_stim_custom_status.setText("")
+
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select CSV", "", "CSV (*.csv)")
         for f in files:
@@ -756,6 +816,7 @@ class BatchAnalysisPage(QWidget):
             cfg.stim_preset_infer_from_name = self.inputs['infer_name'].isChecked()
             cfg.spike_z_sigma = self.inputs['sigma'].value()
             cfg.bg_column_name = self.inputs['bg_col'].text()
+            cfg.bg_column_auto_detect = self.inputs['bg_col_auto'].isChecked()
 
             cfg.use_auto_ylim = self.inputs['auto_ylim'].isChecked()
             if not cfg.use_auto_ylim:
@@ -798,7 +859,16 @@ class BatchAnalysisPage(QWidget):
                 "10s": [(30, 40), (70, 80), (110, 120)],
                 "5s": [(30, 35), (65, 70), (100, 105)]
             }
-            if cfg.stim_preset in presets:
+            if cfg.stim_preset == "custom":
+                if not self.custom_stim_windows:
+                    raise ValueError(
+                        "Stim Preset is 'custom' but no windows were designed. "
+                        "Click 'Design Stim Windows...' first.")
+                cfg.stim_windows_custom = self.custom_stim_windows
+                cfg.stim_windows = self.custom_stim_windows
+                cfg.stim_color = self.custom_stim_color
+                cfg.stim_alpha = self.custom_stim_alpha
+            elif cfg.stim_preset in presets:
                 cfg.stim_windows = presets[cfg.stim_preset]
 
             return cfg
@@ -6738,6 +6808,178 @@ class InteractiveROIScene(QGraphicsScene):
 
 
 # ==========================================
+# 5b2. STIM WINDOW DESIGNER DIALOG
+# ==========================================
+class StimWindowDesignerDialog(QDialog):
+    """
+    Lets the user design custom stimulation windows for the trace plots:
+    baseline length, per-stim duration, rest between stims, how many
+    stimulations, plus the shading color/opacity. The generated windows
+    are also editable row-by-row in a table for irregular spacing.
+    """
+    def __init__(self, parent=None, windows=None, color="#ff0000", alpha=0.15):
+        super().__init__(parent)
+        self.setWindowTitle("Design Stimulation Windows")
+        self.resize(480, 520)
+        self._color = QColor(color)
+        self.setup_ui()
+        if windows:
+            self._populate_table(windows)
+        else:
+            self._regenerate_from_pattern()
+        self._update_color_swatch()
+        self.spin_alpha.setValue(alpha)
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # --- Pattern generator ---
+        grp_pattern = QGroupBox("Generate From Pattern")
+        form = QFormLayout()
+
+        self.spin_n_stims = QSpinBox()
+        self.spin_n_stims.setRange(1, 50)
+        self.spin_n_stims.setValue(3)
+
+        self.spin_baseline = QDoubleSpinBox()
+        self.spin_baseline.setRange(0.0, 3600.0)
+        self.spin_baseline.setSuffix(" s")
+        self.spin_baseline.setValue(30.0)
+
+        self.spin_duration = QDoubleSpinBox()
+        self.spin_duration.setRange(0.01, 3600.0)
+        self.spin_duration.setSuffix(" s")
+        self.spin_duration.setValue(20.0)
+
+        self.spin_rest = QDoubleSpinBox()
+        self.spin_rest.setRange(0.0, 3600.0)
+        self.spin_rest.setSuffix(" s")
+        self.spin_rest.setValue(30.0)
+
+        form.addRow("Number of stimulations:", self.spin_n_stims)
+        form.addRow("Baseline (before 1st stim):", self.spin_baseline)
+        form.addRow("Stim duration (each):", self.spin_duration)
+        form.addRow("Rest between stims:", self.spin_rest)
+        grp_pattern.setLayout(form)
+
+        self.btn_regenerate = QPushButton("Regenerate Table From Pattern")
+        self.btn_regenerate.clicked.connect(self._regenerate_from_pattern)
+
+        # --- Editable table (start/end), for irregular spacing ---
+        grp_table = QGroupBox("Windows (editable — start / end, seconds)")
+        table_layout = QVBoxLayout()
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Start (s)", "End (s)"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table_layout.addWidget(self.table)
+
+        row_btn_layout = QHBoxLayout()
+        self.btn_add_row = QPushButton("Add Row")
+        self.btn_add_row.clicked.connect(self._add_row)
+        self.btn_remove_row = QPushButton("Remove Selected")
+        self.btn_remove_row.clicked.connect(self._remove_selected_rows)
+        row_btn_layout.addWidget(self.btn_add_row)
+        row_btn_layout.addWidget(self.btn_remove_row)
+        table_layout.addLayout(row_btn_layout)
+        grp_table.setLayout(table_layout)
+
+        # --- Appearance ---
+        grp_appearance = QGroupBox("Appearance")
+        appearance_form = QFormLayout()
+
+        color_layout = QHBoxLayout()
+        self.btn_color = QPushButton("Choose Color...")
+        self.btn_color.clicked.connect(self._choose_color)
+        self.lbl_color_swatch = QLabel()
+        self.lbl_color_swatch.setFixedSize(28, 22)
+        self.lbl_color_swatch.setStyleSheet("border: 1px solid #888;")
+        color_layout.addWidget(self.btn_color)
+        color_layout.addWidget(self.lbl_color_swatch)
+        color_layout.addStretch()
+
+        self.spin_alpha = QDoubleSpinBox()
+        self.spin_alpha.setRange(0.0, 1.0)
+        self.spin_alpha.setSingleStep(0.05)
+        self.spin_alpha.setValue(0.15)
+
+        appearance_form.addRow("Window color:", color_layout)
+        appearance_form.addRow("Opacity:", self.spin_alpha)
+        grp_appearance.setLayout(appearance_form)
+
+        # --- Dialog buttons ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout.addWidget(grp_pattern)
+        layout.addWidget(self.btn_regenerate)
+        layout.addWidget(grp_table)
+        layout.addWidget(grp_appearance)
+        layout.addWidget(buttons)
+
+    def _regenerate_from_pattern(self):
+        windows = bp.generate_stim_windows(
+            n_stims=self.spin_n_stims.value(),
+            baseline_s=self.spin_baseline.value(),
+            stim_duration_s=self.spin_duration.value(),
+            rest_s=self.spin_rest.value(),
+        )
+        self._populate_table(windows)
+
+    def _populate_table(self, windows):
+        self.table.setRowCount(0)
+        for start, end in windows:
+            self._add_row(start, end)
+
+    def _add_row(self, start=0.0, end=0.0):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(f"{float(start):.3f}"))
+        self.table.setItem(row, 1, QTableWidgetItem(f"{float(end):.3f}"))
+
+    def _remove_selected_rows(self):
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+
+    def _choose_color(self):
+        color = QColorDialog.getColor(self._color, self, "Choose Stimulation Window Color")
+        if color.isValid():
+            self._color = color
+            self._update_color_swatch()
+
+    def _update_color_swatch(self):
+        self.lbl_color_swatch.setStyleSheet(
+            f"background-color: {self._color.name()}; border: 1px solid #888;")
+
+    def get_windows(self):
+        """Return the validated list of (start, end) tuples, sorted by start time."""
+        windows = []
+        for row in range(self.table.rowCount()):
+            start_item = self.table.item(row, 0)
+            end_item = self.table.item(row, 1)
+            if start_item is None or end_item is None:
+                continue
+            try:
+                start = float(start_item.text())
+                end = float(end_item.text())
+            except ValueError:
+                raise ValueError(f"Row {row + 1}: start/end must be numeric.")
+            if end <= start:
+                raise ValueError(f"Row {row + 1}: end ({end}) must be greater than start ({start}).")
+            windows.append((start, end))
+        return sorted(windows, key=lambda w: w[0])
+
+    def get_color(self):
+        return self._color.name()
+
+    def get_alpha(self):
+        return self.spin_alpha.value()
+
+
+# ==========================================
 # 5c. TRACE VISUALIZATION PAGE
 # ==========================================
 class TraceVisualizationPage(QWidget):
@@ -6751,6 +6993,9 @@ class TraceVisualizationPage(QWidget):
         self.available_conditions = []
         self.available_rois = []
         self.svg_path = None
+        self.custom_stim_windows = None
+        self.custom_stim_color = "#ff0000"
+        self.custom_stim_alpha = 0.15
         self.setup_ui()
 
     def setup_ui(self):
@@ -6885,7 +7130,16 @@ class TraceVisualizationPage(QWidget):
         self.combo_stim_mode.addItem("10s", "10s")
         self.combo_stim_mode.addItem("5s", "5s")
         self.combo_stim_mode.addItem("None", "none")
+        self.combo_stim_mode.addItem("Custom (designed below)", "custom")
         self.combo_stim_mode.setCurrentIndex(0)
+        self.combo_stim_mode.currentIndexChanged.connect(self._on_stim_mode_changed)
+
+        self.btn_design_stim = QPushButton("Design Stim Windows...")
+        self.btn_design_stim.clicked.connect(self._open_stim_designer)
+        self.btn_design_stim.setEnabled(False)
+        self.lbl_stim_custom_status = QLabel("No custom windows designed")
+        self.lbl_stim_custom_status.setStyleSheet("color: #aaa; font-size: 10px;")
+        self.lbl_stim_custom_status.setWordWrap(True)
 
         # -- Offset controls --
         self.combo_offset = QComboBox()
@@ -6906,6 +7160,8 @@ class TraceVisualizationPage(QWidget):
 
         options_layout.addRow("Layout:", self.combo_layout)
         options_layout.addRow("Stim Window:", self.combo_stim_mode)
+        options_layout.addRow("", self.btn_design_stim)
+        options_layout.addRow("", self.lbl_stim_custom_status)
         options_layout.addRow("Condition Offset:", self.combo_offset)
         options_layout.addRow("Manual Offset:", self.spin_manual_offset)
         options_layout.addRow("", self.check_show_stim)
@@ -6967,6 +7223,35 @@ class TraceVisualizationPage(QWidget):
     # ---- slot helpers ----
     def _on_offset_mode_changed(self, idx):
         self.spin_manual_offset.setEnabled(idx == 2)
+
+    def _on_stim_mode_changed(self, idx):
+        self.btn_design_stim.setEnabled(self.combo_stim_mode.currentData() == "custom")
+
+    def _open_stim_designer(self):
+        dlg = StimWindowDesignerDialog(
+            self,
+            windows=self.custom_stim_windows,
+            color=self.custom_stim_color,
+            alpha=self.custom_stim_alpha,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            try:
+                windows = dlg.get_windows()
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid Windows", str(e))
+                return
+            self.custom_stim_windows = windows
+            self.custom_stim_color = dlg.get_color()
+            self.custom_stim_alpha = dlg.get_alpha()
+            if windows:
+                self.lbl_stim_custom_status.setText(
+                    f"{len(windows)} window(s): " +
+                    ", ".join(f"[{s:.1f}-{e:.1f}]" for s, e in windows[:4]) +
+                    (" ..." if len(windows) > 4 else ""))
+                self.lbl_stim_custom_status.setStyleSheet("color: #5fd75f; font-size: 10px;")
+            else:
+                self.lbl_stim_custom_status.setText("No custom windows designed")
+                self.lbl_stim_custom_status.setStyleSheet("color: #aaa; font-size: 10px;")
 
     def _quick_select_conditions(self, pattern: str):
         """Select conditions whose name contains *pattern* (case-insensitive)."""
@@ -7063,6 +7348,11 @@ class TraceVisualizationPage(QWidget):
         show_spikes = self.check_show_spikes.isChecked()
         stim_preset_mode = self.combo_stim_mode.currentData()
 
+        if stim_preset_mode == "custom" and not self.custom_stim_windows:
+            QMessageBox.warning(self, "Warning",
+                                 "Click 'Design Stim Windows...' first, or pick a different Stim Window mode.")
+            return
+
         try:
             svg_path = bp.plot_multi_roi_traces_svg(
                 analysis_output_folder=self.analysis_folder,
@@ -7076,6 +7366,9 @@ class TraceVisualizationPage(QWidget):
                 condition_offset=offset_mode,
                 manual_offset_value=manual_val,
                 stim_preset_mode=stim_preset_mode,
+                custom_stim_windows=self.custom_stim_windows,
+                stim_color=self.custom_stim_color,
+                stim_alpha=self.custom_stim_alpha,
             )
 
             self.svg_path = svg_path
@@ -7116,6 +7409,11 @@ class TraceVisualizationPage(QWidget):
         show_spikes = self.check_show_spikes.isChecked()
         stim_preset_mode = self.combo_stim_mode.currentData()
 
+        if stim_preset_mode == "custom" and not self.custom_stim_windows:
+            QMessageBox.warning(self, "Warning",
+                                 "Click 'Design Stim Windows...' first, or pick a different Stim Window mode.")
+            return
+
         offset_modes = ["none", "auto", "manual"]
         offset_mode = offset_modes[self.combo_offset.currentIndex()]
         manual_val = self.spin_manual_offset.value()
@@ -7137,6 +7435,9 @@ class TraceVisualizationPage(QWidget):
                 show_stim_windows=show_stim,
                 show_spike_markers=show_spikes,
                 stim_preset_mode=stim_preset_mode,
+                custom_stim_windows=self.custom_stim_windows,
+                stim_color=self.custom_stim_color,
+                stim_opacity=self.custom_stim_alpha,
                 condition_offset=offset_mode,
                 manual_offset_value=manual_val,
             )

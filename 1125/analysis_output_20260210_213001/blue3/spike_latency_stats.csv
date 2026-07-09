@@ -1,0 +1,5 @@
+ROI,n_latencies,mean_latency_s,median_latency_s,std_latency_s,min_latency_s,max_latency_s
+ROI.01 [],3,0.25900000000000034,0.0,0.3662813126546321,0.0,0.777000000000001
+ROI.02 [],3,0.0,0.0,0.0,0.0,0.0
+ROI.04 [],3,0.0,0.0,0.0,0.0,0.0
+ROI.05 [],3,0.0,0.0,0.0,0.0,0.0

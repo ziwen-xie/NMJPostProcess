@@ -1,0 +1,4 @@
+Parameter,Replicate,1,10,12
+2hz,1,,1.0,6.0
+2hz,2,1.0,,
+Ctrl,1,2.0,3.0,
