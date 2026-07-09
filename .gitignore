@@ -1,0 +1,19 @@
+# Large local-only manuscript source (~286 MB .docx) — kept out of git
+paper/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Regenerable analysis image/vector artifacts (excluded to keep the repo lean;
+# these are produced by the pipeline and bloated history to >1.6 GB previously)
+*_preview.png
+data/results/**/*.png
+data/results/**/*.svg
+data/results/**/*.html
+tests/**/*.png
+tests/**/*.svg
