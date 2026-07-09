@@ -107,7 +107,9 @@ class Config:
     out_fig_spiking_only: Optional[str] = "deltaF_F_spiking_only.png"
 
     # Spike width filter
-    width_mode: str = "rough"
+    # "fwhm" = full-width-at-half-maximum (paper definition: width measured at half
+    # amplitude relative to baseline). "rough" = raw time-above-threshold (legacy).
+    width_mode: str = "fwhm"
     width_threshold_s: float = 2.0  # Changed default to 2 seconds
 
     # ROIs to exclude from plotting
@@ -269,9 +271,12 @@ def dff_percentile_window(
         t1 = min(t[-1], t[i] + window_half_s)
         idx = (t >= t0) & (t <= t1)
         F0[i] = np.percentile(F[idx], percentile)
-    # Use abs(F0) to prevent signal inversion when F0 is negative (after background subtraction)
-    # Small epsilon added to avoid division by zero
-    dff = (F - F0) / (np.abs(F0) + 1e-9)
+    # Standard ΔF/F₀ = (F - F0) / F0 (sign preserved). Only guard exact/near-zero
+    # baselines against division by zero; do NOT take abs(F0) (that inverts the
+    # sign of transients on ROIs whose background-subtracted baseline is negative).
+    denom = F0.copy()
+    denom[np.abs(denom) < 1e-9] = 1e-9
+    dff = (F - F0) / denom
     return dff, F0
 
 
@@ -298,14 +303,13 @@ def dff_fixed_baseline(
 
     Notes
     -----
-    When F0 is negative (after background subtraction), we use abs(F0) in the
-    denominator to prevent signal inversion. The numerator (F - F0) correctly
-    represents the change from baseline.
+    Standard ΔF/F₀ = (F - F0) / F0 with the sign preserved. Only exact/near-zero
+    baselines are guarded against division by zero; abs(F0) is intentionally NOT
+    used (it would invert the sign of transients when F0 is negative).
     """
     F0 = np.full_like(F, F0_value, dtype=float)
-    # Use abs(F0_value) to prevent signal inversion when F0 is negative
-    # Small epsilon added to avoid division by zero
-    dff = (F - F0) / (abs(F0_value) + 1e-9)
+    denom = F0_value if abs(F0_value) >= 1e-9 else 1e-9
+    dff = (F - F0) / denom
     return dff, F0
 
 
@@ -898,8 +902,12 @@ def detect_spikes_across_rois(
             accepted_peak_idxs = np.array(sorted(accepted_peak_idxs), dtype=int)
             peak_times = t[accepted_peak_idxs]
 
-            # Exclude spikes before 10 seconds
-            peak_times = peak_times[peak_times >= 10.0]
+            # Exclude events in the pre-stimulation baseline region. The paper
+            # excludes the initial baseline period (the recording starts with a
+            # light-free baseline before the first stimulation window). Use the
+            # first stim-window start as the boundary; fall back to 30 s.
+            baseline_end_s = min((w[0] for w in stim_windows), default=30.0) if stim_windows else 30.0
+            peak_times = peak_times[peak_times >= baseline_end_s]
 
             # Exclude spikes inside stim windows BEFORE min-distance filtering.
             # This prevents a stim-artifact peak from blocking a nearby
@@ -2073,20 +2081,47 @@ def run(cfg: Config):
 
 # BATCH PROCESSING FUNCTIONS
 
+def canonicalize_condition_group(name: Optional[str]) -> Optional[str]:
+    """Normalize a condition token to a canonical, case-insensitive label.
+
+    Ensures replicates that differ only in letter case (e.g. "2Hz" vs "2hz",
+    "1mW" vs "1mw", "5Hz" vs "5hz", "5S" vs "5s") aggregate into one condition
+    group instead of being split into separate bars.
+    """
+    if not name:
+        return name
+    token = str(name).strip()
+    low = token.lower()
+    m = re.fullmatch(r"(\d+)\s*hz", low)
+    if m:
+        return f"{int(m.group(1))}Hz"
+    m = re.fullmatch(r"(\d+)\s*mw", low)
+    if m:
+        return f"{int(m.group(1))}mW"
+    m = re.fullmatch(r"(\d+)\s*s", low)
+    if m:
+        return f"{int(m.group(1))}s"
+    if low == "ctrl":
+        return "Ctrl"
+    if low in ("blue", "red"):
+        return low
+    return token
+
+
 def parse_experiment_filename(filename: str) -> Optional[Tuple[str, int]]:
     name = Path(filename).stem
     pattern1 = r"^([a-zA-Z0-9]+?)(\d+)$"
     match = re.match(pattern1, name)
     if match:
-        return (match.group(1), int(match.group(2)))
+        return (canonicalize_condition_group(match.group(1)), int(match.group(2)))
     pattern2 = r"^(\d+)-(\d+)$"
     match = re.match(pattern2, name)
     if match:
-        return (match.group(1), int(match.group(2)))
+        return (canonicalize_condition_group(match.group(1)), int(match.group(2)))
     pattern3 = r"^([a-zA-Z0-9]+)$"
     match = re.match(pattern3, name)
     if match:
-        return (match.group(1), 1)
+        return (canonicalize_condition_group(match.group(1)), 1)
     return None
 
 

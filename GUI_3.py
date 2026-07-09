@@ -677,7 +677,7 @@ class BatchAnalysisPage(QWidget):
         self.inputs['bg_col'] = QLineEdit("ROI.01 []")
         self.inputs['bg_col_auto'] = QCheckBox("Auto-detect BG Column (lowest-numbered ROI)")
         self.inputs['bg_col_auto'].setChecked(True)
-        self.inputs['bg_col_auto'].toggled.connect(lambda checked: self.inputs['bg_col'].setEnabled(not checked))
+        self.inputs['bg_col_auto'].toggled.connect(self._on_bg_auto_toggled)
         self.inputs['bg_col'].setEnabled(False)
 
         self.inputs['auto_ylim'] = QCheckBox("Use Auto Y-Limits")
@@ -764,6 +764,36 @@ class BatchAnalysisPage(QWidget):
     def toggle_ylim(self, checked):
         self.inputs['ylim_max'].setEnabled(not checked)
 
+    def _on_bg_auto_toggled(self, checked):
+        # Textbox is editable only for manual entry; when auto-detect is on we
+        # keep it read-only but fill it with the detected column so the user can
+        # see which ROI is being used as background.
+        self.inputs['bg_col'].setEnabled(not checked)
+        if checked:
+            self._refresh_detected_bg_col()
+
+    def _refresh_detected_bg_col(self):
+        """Detect the background ROI column from the first loaded file and show
+        its name in the BG-column textbox (auto-detect mode only)."""
+        if not self.inputs['bg_col_auto'].isChecked():
+            return
+        if not self.file_paths:
+            return
+        try:
+            s_in = self.settings_ref.inputs
+            enc = bp.Config().encoding
+            df = bp.load_fluo_csv(
+                self.file_paths[0],
+                encoding=enc,
+                skip_first_row=s_in['skip_row'].isChecked(),
+            )
+            detected = bp.detect_bg_column(df, s_in['roi_key'].text())
+            if detected:
+                self.inputs['bg_col'].setText(detected)
+        except Exception as e:
+            # Detection is best-effort; never block the UI on a bad/locked file.
+            print(f"[BG auto-detect] could not detect column: {e}")
+
     def _open_stim_designer(self):
         dlg = StimWindowDesignerDialog(
             self,
@@ -798,6 +828,8 @@ class BatchAnalysisPage(QWidget):
             if f not in self.file_paths:
                 self.file_paths.append(f)
                 self.file_list.addItem(os.path.basename(f))
+        # Show the auto-detected background column now that a file is available.
+        self._refresh_detected_bg_col()
 
     def clear_files(self):
         self.file_paths = []
@@ -1002,28 +1034,32 @@ class SpikeLatencyReviewPage(QWidget):
     """
     @staticmethod
     def extract_condition_group(condition_name):
-        """Extract condition group from condition name.
+        """Extract condition group from condition name (case-insensitive).
 
         Ctrl / Ctrl1 → 'Ctrl'  (no-light control)
-        Ctrl2, Ctrl3, … → 'Far Light Control'  (second control group)
-        Other trailing digits are stripped to form the group name.
+        Ctrl2, Ctrl3, … and Ctrl_far / Ctrlfar → 'Far Light Control'
+        Other trailing replicate digits are stripped and the remaining token is
+        canonicalized so that case variants (2Hz/2hz, 1mW/1mw) group together.
         """
         import re
-        # Handle Ctrl variants: Ctrl and Ctrl1 stay as "Ctrl",
-        # Ctrl2+ are "Far Light Control"
-        ctrl_match = re.match(r'^Ctrl(\d*)$', condition_name, re.IGNORECASE)
+        name = str(condition_name).strip()
+        low = name.lower()
+        # Control conditions (case-insensitive). "far" or a replicate number >= 2
+        # denotes the far-light control; plain Ctrl / Ctrl1 is the no-light control.
+        ctrl_match = re.fullmatch(r'ctrl[_\- ]?(far)?(\d*)', low)
         if ctrl_match:
-            num = ctrl_match.group(1)
-            if num == '' or num == '1':
-                return 'Ctrl'
-            return 'Far Light Control'
-        match = re.match(r'^([a-zA-Z0-9]+?)\d+$', condition_name)
-        if match:
-            return match.group(1)
-        match = re.match(r'^(\d+)-\d+$', condition_name)
-        if match:
-            return match.group(1)
-        return condition_name
+            is_far = ctrl_match.group(1) == 'far'
+            num = ctrl_match.group(2)
+            if is_far or (num not in ('', '1')):
+                return 'Far Light Control'
+            return 'Ctrl'
+        # Strip a trailing replicate index, then canonicalize case.
+        m = re.fullmatch(r'([a-z0-9]+?)\d+', low, re.IGNORECASE)
+        base = m.group(1) if m else name
+        m2 = re.fullmatch(r'(\d+)-\d+', base)
+        if m2:
+            base = m2.group(1)
+        return bp.canonicalize_condition_group(base)
 
     # ── grouped colour defaults ───────────────────────────────────────────
     #   Conditions within the same experimental variable share a hue family
