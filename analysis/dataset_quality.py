@@ -27,7 +27,9 @@ sys.path.insert(0, os.path.abspath("."))
 import BatchProcess as bp  # noqa: E402
 
 TIME_COL, ROI_KEY = "Axis [s]", "ROI"
-BASE_RANGE, SIGMA, MIN_DIST, EXCLUDE_STIM = (10, 30), 3.0, 5.0, "all"
+# SIGMA=6 and dimmest-ROI background (bp.detect_bg_column default) match the
+# tuned pipeline. REAL_AMP flags events large enough to be genuine transients.
+BASE_RANGE, SIGMA, MIN_DIST, EXCLUDE_STIM, REAL_AMP = (10, 30), 6.0, 5.0, "all", 0.05
 
 
 def load_csv(path):
@@ -81,15 +83,23 @@ def is_ctrl(group):
 
 
 def detect(cache, width_threshold):
+    """Returns (n_events, n_responding_rois, n_det_cols, event_amplitudes)."""
     exclude = bp.should_exclude_spikes_in_stim(EXCLUDE_STIM, cache["path"])
     _, _, spikes = bp.detect_spikes_across_rois(
         dff_table=cache["dff_table"], roi_cols=cache["det_cols"], time_col="Time (s)",
         baseline_range=BASE_RANGE, spike_z_sigma=SIGMA, min_distance_s=MIN_DIST,
         width_mode="fwhm", width_threshold_s=width_threshold,
         stim_windows=cache["stim_windows"], exclude_spikes_in_windows=exclude)
+    ti = cache["dff_table"]["Time (s)"].to_numpy()
+    amps = []
+    for col, tms in spikes.items():
+        if len(tms):
+            y = cache["dff_table"][col].to_numpy()
+            for tt in tms:
+                amps.append(float(y[np.argmin(np.abs(ti - tt))]))
     n_ev = int(sum(len(v) for v in spikes.values()))
     n_resp = int(sum(1 for v in spikes.values() if len(v) > 0))
-    return n_ev, n_resp, len(cache["det_cols"])
+    return n_ev, n_resp, len(cache["det_cols"]), amps
 
 
 def iter_caches(folders):
@@ -110,7 +120,7 @@ def cmd_width(folders, thresholds):
     for thr in thresholds:
         se = ce = sr = cr = 0
         for c in caches:
-            ne, nr, _ = detect(c, thr)
+            ne, nr, _, _ = detect(c, thr)
             if is_ctrl(c["group"]):
                 ce += ne; cr += nr
             else:
@@ -123,40 +133,39 @@ def cmd_rank(folders, width):
     rows = []
     for fol in folders:
         exp_type, name = Path(fol).parent.name, Path(fol).name
-        acc = dict(stim_ev=0, ctrl_ev=0, stim_roi=0, stim_resp=0, ctrl_roi=0,
-                   ctrl_resp=0, neg=0, tot=0, nfiles=0, conds=set())
+        acc = dict(stim_ev=0, ctrl_ev=0, stim_real=0, ctrl_real=0, nfiles=0, conds=set())
+        amps = []
         for _, c in iter_caches([fol]):
             acc["nfiles"] += 1
             acc["conds"].add(c["group"])
-            acc["neg"] += c["n_neg_f0"]; acc["tot"] += c["n_roi"]
-            ne, nr, nd = detect(c, width)
+            ne, nr, nd, ea = detect(c, width)
+            real = sum(1 for a in ea if a >= REAL_AMP)
             if is_ctrl(c["group"]):
-                acc["ctrl_ev"] += ne; acc["ctrl_roi"] += nd; acc["ctrl_resp"] += nr
+                acc["ctrl_ev"] += ne; acc["ctrl_real"] += real
             else:
-                acc["stim_ev"] += ne; acc["stim_roi"] += nd; acc["stim_resp"] += nr
+                acc["stim_ev"] += ne; acc["stim_real"] += real; amps.extend(ea)
         if acc["nfiles"] == 0:
             continue
-        ev_ratio = acc["stim_ev"] / acc["ctrl_ev"] if acc["ctrl_ev"] else float("inf")
+        # ratio uses REAL (large-amplitude) events, which reflect true transients
+        real_ratio = acc["stim_real"] / acc["ctrl_real"] if acc["ctrl_real"] else (
+            float("inf") if acc["stim_real"] else 0.0)
+        med_amp = float(np.median([a for a in amps if a >= REAL_AMP])) if any(a >= REAL_AMP for a in amps) else 0.0
         n_conds = len([g for g in acc["conds"] if not is_ctrl(g)])
-        rows.append(dict(exp_type=exp_type, name=name, ev_ratio=ev_ratio,
-                         neg_pct=100 * acc["neg"] / max(acc["tot"], 1), n_conds=n_conds, **acc))
+        rows.append(dict(exp_type=exp_type, name=name, real_ratio=real_ratio,
+                         med_amp=med_amp, n_conds=n_conds, **acc))
 
     def score(r):
-        # Reward stim:control event ratio, condition breadth, and enough events.
-        # neg_pct is reported for context but not penalized: once ΔF/F is
-        # normalized by the raw baseline, a bright background (negative corrected
-        # baseline) no longer distorts the traces.
-        er = min(r["ev_ratio"], 20) if np.isfinite(r["ev_ratio"]) else 20
-        return er * 2 + r["n_conds"] * 2 + min(r["stim_ev"], 500) / 100
+        rr = min(r["real_ratio"], 20) if np.isfinite(r["real_ratio"]) else 20
+        return r["stim_real"] + rr * 3 + r["n_conds"] * 3
 
     rows.sort(key=score, reverse=True)
-    print(f"\n===== DATASET RANKING (width={width}s, by stim:control event ratio + coverage) =====", flush=True)
-    print(f"{'#':>3} {'type':<17} {'folder':<11} {'files':>5} {'stimEv':>6} {'ctrlEv':>6} "
-          f"{'evRatio':>7} {'#cond':>5} {'neg%':>5}", flush=True)
+    print(f"\n===== DATASET RANKING (width={width}s, sigma={SIGMA}, real events >= {REAL_AMP:.0%} dF/F) =====", flush=True)
+    print(f"{'#':>3} {'type':<17} {'folder':<11} {'files':>5} {'stimReal':>8} {'ctrlReal':>8} "
+          f"{'ratio':>6} {'medAmp':>6} {'#cond':>5}", flush=True)
     for i, r in enumerate(rows, 1):
-        er = f"{r['ev_ratio']:.1f}" if np.isfinite(r["ev_ratio"]) else "inf"
-        print(f"{i:>3} {r['exp_type']:<17} {r['name']:<11} {r['nfiles']:>5} {r['stim_ev']:>6} "
-              f"{r['ctrl_ev']:>6} {er:>7} {r['n_conds']:>5} {r['neg_pct']:>5.1f}", flush=True)
+        rr = f"{r['real_ratio']:.1f}" if np.isfinite(r["real_ratio"]) else "inf"
+        print(f"{i:>3} {r['exp_type']:<17} {r['name']:<11} {r['nfiles']:>5} {r['stim_real']:>8} "
+              f"{r['ctrl_real']:>8} {rr:>6} {r['med_amp']:>6.2f} {r['n_conds']:>5}", flush=True)
 
 
 def main():

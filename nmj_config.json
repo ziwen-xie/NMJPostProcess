@@ -18,7 +18,7 @@
   "max_latency_window": 0.0,
   "preset": "20s",
   "infer_name": true,
-  "sigma": 3.0,
+  "sigma": 6.0,
   "bg_col": "ROI.000 []",
   "auto_ylim": true,
   "ylim_max": 0.3

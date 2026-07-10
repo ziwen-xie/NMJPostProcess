@@ -36,6 +36,9 @@ class Config:
     bg_source: str = "roi_column"
     bg_column_name: str = "ROI.01 []"
     bg_column_auto_detect: bool = True  # if True, guess the background ROI column from the CSV header
+    # How auto-detect picks the background ROI: "dimmest" (lowest median intensity,
+    # i.e. the cell-free region) or "lowest_index" (legacy: lowest-numbered ROI).
+    bg_auto_method: str = "dimmest"
     bg_csv_path: str = "./0718/bg.csv"
     bg_csv_col_name: Optional[str] = None
 
@@ -72,7 +75,9 @@ class Config:
     baseline_index_start: int = 10
     baseline_index_end: int = 20
     baseline_frames_for_spike: int = 29
-    spike_z_sigma: float = 5.0
+    # z-score threshold = baseline_mean + spike_z_sigma * baseline_sd. Raised to 6
+    # so only clear transients count; 3 sigma detected noise on low-SNR ROIs.
+    spike_z_sigma: float = 6.0
     min_spike_distance_s: Optional[float] = 3.0  # Changed default to 3 seconds
     exclude_bg_roi_from_detection: bool = True
     out_spike_csv: Optional[str] = "spike_summary.csv"
@@ -185,17 +190,30 @@ def find_roi_columns(df: pd.DataFrame, roi_key: str) -> List[str]:
     return [c for c in df.columns if roi_key in c]
 
 
-def detect_bg_column(df: pd.DataFrame, roi_key: str = "ROI") -> Optional[str]:
+def detect_bg_column(df: pd.DataFrame, roi_key: str = "ROI",
+                     method: str = "dimmest") -> Optional[str]:
     """
     Guess the background/reference ROI column from a fluorescence CSV.
 
-    By convention the background channel is the lowest-numbered ROI column
-    (e.g. 'ROI.00 []' or 'ROI.01 []', depending on whether the acquisition
-    software indexes from 0 or 1). Returns None if no ROI columns are found.
+    method="dimmest" (default): pick the ROI with the lowest median intensity.
+        A cell-free background region carries no GCaMP signal, so it should be
+        the darkest ROI. This avoids subtracting a bright real cell (which drives
+        the corrected trace negative and destroys the ΔF/F scale).
+    method="lowest_index": legacy heuristic — pick the lowest-numbered ROI column.
+
+    Returns None if no ROI columns are found.
     """
     roi_cols = find_roi_columns(df, roi_key)
     if not roi_cols:
         return None
+
+    if method == "dimmest":
+        def _median(col):
+            try:
+                return float(np.nanmedian(df[col].to_numpy(dtype=float)))
+            except Exception:
+                return float("inf")
+        return min(roi_cols, key=_median)
 
     def _index_of(col: str) -> Optional[int]:
         after_key = col.split(roi_key, 1)[-1]
@@ -217,7 +235,8 @@ def select_background(df_main: pd.DataFrame, cfg: Config) -> np.ndarray:
 
     if cfg.bg_source == "roi_column":
         if cfg.bg_column_auto_detect:
-            detected = detect_bg_column(df_main, cfg.roi_key)
+            detected = detect_bg_column(df_main, cfg.roi_key,
+                                        method=getattr(cfg, "bg_auto_method", "dimmest"))
             if detected is not None:
                 cfg.bg_column_name = detected
         if cfg.bg_column_name not in df_main.columns:

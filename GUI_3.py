@@ -672,10 +672,10 @@ class BatchAnalysisPage(QWidget):
         self.inputs['infer_name'] = QCheckBox("Infer from Filename")
         self.inputs['infer_name'].setChecked(True)
         self.inputs['sigma'] = QDoubleSpinBox()
-        self.inputs['sigma'].setValue(5.0)
+        self.inputs['sigma'].setValue(6.0)
 
         self.inputs['bg_col'] = QLineEdit("ROI.01 []")
-        self.inputs['bg_col_auto'] = QCheckBox("Auto-detect BG Column (lowest-numbered ROI)")
+        self.inputs['bg_col_auto'] = QCheckBox("Auto-detect BG Column (dimmest ROI = cell-free background)")
         self.inputs['bg_col_auto'].setChecked(True)
         self.inputs['bg_col_auto'].toggled.connect(self._on_bg_auto_toggled)
         self.inputs['bg_col'].setEnabled(False)
