@@ -11,7 +11,7 @@
   "baseline_end_frame": 30,
   "control_pattern": "Ctrl1",
   "min_dist": 5.0,
-  "width_thr": 2.0,
+  "width_thr": 1.0,
   "exclude_stim": 1,
   "calc_latencies": true,
   "latency_method": 2,

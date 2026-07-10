@@ -389,7 +389,7 @@ class SettingsPage(QWidget):
 
         self.inputs['width_thr'] = QDoubleSpinBox()
         self.inputs['width_thr'].setRange(0.01, 10.0)
-        self.inputs['width_thr'].setValue(2.0)  # Changed default to 2.0
+        self.inputs['width_thr'].setValue(1.0)  # FWHM min width, tuned on 0806 data
         self.inputs['width_thr'].setSingleStep(0.1)
 
         # Changed from checkbox to combobox for exclude stim options

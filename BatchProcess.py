@@ -54,6 +54,10 @@ class Config:
     # ΔF/F baseline
     baseline_window_half_s: float = 15.0
     baseline_percentile: float = 8.0
+    # Normalize ΔF/F by the RAW ROI baseline (always positive) instead of the
+    # background-subtracted baseline. Prevents negative / near-zero denominators
+    # (and the resulting sign-inverted / blown-up traces) on dim ROIs.
+    dff_normalize_by_raw: bool = True
 
     # Stimulation windows
     stim_preset: str = "20s"
@@ -110,7 +114,9 @@ class Config:
     # "fwhm" = full-width-at-half-maximum (paper definition: width measured at half
     # amplitude relative to baseline). "rough" = raw time-above-threshold (legacy).
     width_mode: str = "fwhm"
-    width_threshold_s: float = 2.0  # Changed default to 2 seconds
+    # Minimum FWHM (s) for an event. 1.0 s = >=2 frames at 2 fps; tuned on 0806
+    # data (better stim:control separation and ~2x more events than 2.0 s).
+    width_threshold_s: float = 1.0
 
     # ROIs to exclude from plotting
     exclude_roi_map: Dict[str, bool] = field(default_factory=dict)
@@ -262,19 +268,34 @@ def dff_percentile_window(
         F: np.ndarray,
         t: np.ndarray,
         window_half_s: float,
-        percentile: float
+        percentile: float,
+        F_denom: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Moving-window percentile ΔF/F₀.
+
+    F        : trace to normalize (typically background-subtracted).
+    F_denom  : optional trace whose moving-percentile baseline is used as the
+               denominator (e.g. the RAW ROI fluorescence, which is always
+               positive). When given, ΔF/F = (F - F0) / F0_raw, which avoids the
+               negative / near-zero denominators produced by normalizing a
+               background-subtracted trace by its own baseline. When None, the
+               denominator is F0 of F (legacy behavior).
+    Returns (dff, F0) where F0 is the numerator baseline of F.
+    """
     n = F.size
-    F0 = np.zeros_like(F, dtype=float)
+    F0 = np.zeros_like(F, dtype=float)          # numerator baseline (of F)
+    use_sep_denom = F_denom is not None
+    F0_den = np.zeros_like(F, dtype=float) if use_sep_denom else F0
     for i in range(n):
         t0 = max(t[0], t[i] - window_half_s)
         t1 = min(t[-1], t[i] + window_half_s)
         idx = (t >= t0) & (t <= t1)
         F0[i] = np.percentile(F[idx], percentile)
-    # Standard ΔF/F₀ = (F - F0) / F0 (sign preserved). Only guard exact/near-zero
-    # baselines against division by zero; do NOT take abs(F0) (that inverts the
-    # sign of transients on ROIs whose background-subtracted baseline is negative).
-    denom = F0.copy()
+        if use_sep_denom:
+            F0_den[i] = np.percentile(F_denom[idx], percentile)
+    # ΔF/F₀ = (F - F0) / denom. Guard exact/near-zero denominators against
+    # division by zero; never take abs() (that would invert transient signs).
+    denom = F0_den.copy()
     denom[np.abs(denom) < 1e-9] = 1e-9
     dff = (F - F0) / denom
     return dff, F0
@@ -330,7 +351,11 @@ def compute_all_dff(
         print(f"\nUsing shared baseline for {len(cfg.shared_baseline_values)} ROIs")
 
     for col in roi_cols:
-        F_corr = background_subtraction(df_main[col].to_numpy(dtype=float), bg_vec)
+        F_raw = df_main[col].to_numpy(dtype=float)
+        F_corr = background_subtraction(F_raw, bg_vec)
+        # Normalize by the RAW baseline (always positive) rather than the
+        # background-subtracted baseline, unless disabled in config.
+        F_denom = F_raw if getattr(cfg, "dff_normalize_by_raw", True) else None
 
         if use_shared_baseline and col in cfg.shared_baseline_values:
             # Use fixed baseline from shared baseline values
@@ -349,6 +374,7 @@ def compute_all_dff(
                 F_corr, t,
                 window_half_s=cfg.baseline_window_half_s,
                 percentile=cfg.baseline_percentile,
+                F_denom=F_denom,
             )
 
         dff_dict[col] = dff_vals
