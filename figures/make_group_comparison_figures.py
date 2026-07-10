@@ -44,7 +44,11 @@ plt.rcParams.update({
 })
 
 # ---- detection config ----
-SIGMA, WIDTH, MINDIST, LAT_CAP = 6.0, 1.0, 5.0, 60.0
+# sigma=3.5 is the most sensitive threshold that still keeps the 0718 no-light
+# control silent (0 events); it maximizes stim-vs-control separation. 0717's
+# control (test.csv) is not silent at any sigma - a dataset limitation, not a
+# threshold one. Matches the paper's mean+~3sigma detection.
+SIGMA, WIDTH, MINDIST, LAT_CAP = 3.5, 1.0, 5.0, 60.0
 ARTIFACT_CAP = 5.0        # drop ROI if |dF/F| ever exceeds this (saturation/motion)
 FIELD_ARTIFACT_FRAC = 0.30  # skip file if >30% of ROIs exceed 0.3 dF/F (field artifact)
 
@@ -192,7 +196,10 @@ def make_figure(dataset, data):
     out.mkdir(parents=True, exist_ok=True)
     base = out / f"fig_{dataset}_group_comparison"
     for ext, kw in [(".svg", {}), (".pdf", {}), (".png", {"dpi": 350})]:
-        fig.savefig(base.with_suffix(ext), facecolor="white", **kw)
+        try:
+            fig.savefig(base.with_suffix(ext), facecolor="white", **kw)
+        except PermissionError:
+            print(f"  WARNING: {base.with_suffix(ext).name} is locked (open in a viewer?) - skipped")
     plt.close(fig)
     return base.with_suffix(".svg")
 
