@@ -206,8 +206,74 @@ def version3():
     return _save(fig, OUT / "abstract_v3_hero")
 
 
+def _spatial_panel(ax, perroi):
+    resp = {n: (float(np.mean(perroi[n]["stim"])) if perroi[n]["stim"] else 0.0)
+            for n in perroi if n in F.ROI_XY}
+    xs = [F.ROI_XY[n][0] for n in resp]; ys = [F.ROI_XY[n][1] for n in resp]
+    cs = [resp[n] for n in resp]; vmax = max(cs) if any(cs) else 1.0
+    sc = ax.scatter(xs, ys, c=cs, s=760, cmap="hot_r", vmin=0, vmax=vmax,
+                    edgecolor="black", linewidths=1.4, zorder=2)
+    for n in resp:
+        ax.text(F.ROI_XY[n][0], F.ROI_XY[n][1], f"{n:02d}", ha="center", va="center",
+                fontsize=FS["seg"] - 4, fontweight="bold", zorder=3,
+                color="white" if resp[n] > vmax * 0.55 else "black")
+    ax.scatter(*F.PIXEL_XY, marker="s", s=420, facecolor="red", edgecolor="black",
+               linewidths=1.6, zorder=1)
+    ax.annotate("stim\npixel", F.PIXEL_XY, textcoords="offset points", xytext=(0, -30),
+                ha="center", color="red", fontsize=FS["seg"], fontweight="bold")
+    ax.set_aspect("equal"); ax.invert_yaxis(); ax.axis("off")
+    ax.margins(0.12)
+    ax.set_title("Response map", fontsize=FS["axlabel"], fontweight="bold")
+    cb = ax.figure.colorbar(sc, ax=ax, fraction=0.040, pad=0.02)
+    cb.set_label("events / rec", fontsize=FS["tick"] - 6)
+    cb.ax.tick_params(labelsize=FS["tick"] - 8)
+    return cb
+
+
+def _contact_panel(ax):
+    import matplotlib.image as mpimg
+    img = mpimg.imread(str(OUT.parent / "assets" / "contact_ch470.png"))
+    g = img[..., 0] if img.ndim == 3 else img
+    lo, hi = np.percentile(g, 2), np.percentile(g, 99.5)
+    ax.imshow(np.clip((g - lo) / (hi - lo), 0, 1), cmap="gray")
+    ax.axis("off")
+    ax.set_title("Array–cell contact (GCaMP, 100 µm bar)", fontsize=FS["axlabel"], fontweight="bold")
+
+
+def _placeholder(ax, text):
+    ax.axis("off")
+    ax.add_patch(plt.Rectangle((0.02, 0.05), 0.96, 0.9, transform=ax.transAxes,
+                 facecolor="#F5F5F5", edgecolor="#AAAAAA", lw=2.4, ls="--"))
+    ax.text(0.5, 0.5, text, transform=ax.transAxes, ha="center", va="center",
+            fontsize=FS["take"], color="#888", wrap=True)
+
+
+def version4():
+    """Enriched composite: device schematic (placeholder) + contact image +
+    spatial map + representative trace + quantification."""
+    recs = _load_recs(); ctrl, stim = _compare()
+    _, perroi = F.collect_compare()
+    T = float(recs[0][0]["Time (s)"].to_numpy()[-1]) + 0.5
+    fig = plt.figure(figsize=(W_IN, 19.5), dpi=DPI)
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.05, 1.0], width_ratios=[1, 1, 1.05],
+                          hspace=0.30, wspace=0.22, left=0.045, right=0.915,
+                          top=0.80, bottom=0.075)
+    _placeholder(fig.add_subplot(gs[0, 0]), "µLED array device schematic\n(insert mechanical drawing)")
+    _contact_panel(fig.add_subplot(gs[0, 1]))
+    _spatial_panel(fig.add_subplot(gs[0, 2]), perroi)
+    axt = fig.add_subplot(gs[1, :2])
+    _trace_concat(axt, recs, 12, T, (-0.08, 0.50), seg_tags=True)
+    axt.set_xlabel("Time  —  no-light control, then 6 red-µLED stim recordings", fontsize=FS["axlabel"])
+    _bar(fig.add_subplot(gs[1, 2]), ctrl, stim)
+    fig.text(0.5, 0.945, TITLE, ha="center", fontsize=FS["title"], fontweight="bold")
+    fig.text(0.5, 0.875, "Single-pixel red µLED · PC12–C2C12, GCaMP8s · control silent · "
+             "ΔF/F up to ~0.4 · reproducible across 6 trials",
+             ha="center", fontsize=FS["take"], color="#333")
+    return _save(fig, OUT / "abstract_v4_enriched")
+
+
 def main():
-    for fn in (version1, version2, version3):
+    for fn in (version1, version2, version3, version4):
         print("wrote:", fn())
 
 
