@@ -50,7 +50,7 @@ def collect():
                 latmap.setdefault(r["ROI"], []).append(r["latency_s"])
         for c in det:
             n = F.roinum(c)
-            if n not in coords:
+            if n not in coords or n in (2, 3):   # 02/03 on the pixel: leakage, exclude
                 continue
             d = float(np.hypot(coords[n][0] - px[0], coords[n][1] - px[1]))
             rec = per.setdefault(n, dict(dist=d, counts=[], amps=[], lats=[]))
