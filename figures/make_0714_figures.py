@@ -5,12 +5,16 @@ after another) + one no-light control (Ctrl.csv). 14 ROIs, 2 fps, ~155 s each,
 three 10 s stim windows per file at 30-40 / 70-80 / 110-120 s. ROI.01 = background.
 
 Outputs (figures/0714/):
-  A) example traces of representative stim-locked ROIs, with the 6 recordings
-     CONCATENATED into one continuous timeline (18 stim windows) + marked events
+  A) example traces of representative ROIs, 6 stim recordings + the no-light
+     control CONCATENATED into one timeline (18 stim windows + control block)
   B) Control vs Stim comparison: event count / amplitude / latency
 
-Detection: ROI.01 background, raw-baseline dF/F, mean+4*sd (control ~silent,
-spontaneous OK), FWHM >= 1.0 s, min dist 5 s, latency from stim onset.
+ROI.02/03 sit on the stim pixel -> their in-window peaks are red-light leakage,
+not calcium, so they are excluded. Detection: ROI.01 background, raw-baseline
+dF/F, prominence-based peak detector (robust lower-percentile noise; peaks must
+clear both height and prominence >= k*sigma) which catches obvious transients
+(incl. pre-stim spontaneous) while rejecting small noise bumps. Latency from
+stim onset (stimulated recordings only).
 """
 from __future__ import annotations
 import os, re, sys
@@ -26,6 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt                 # noqa: E402
 from matplotlib.patches import Rectangle        # noqa: E402
 from scipy import stats as sps                  # noqa: E402
+from scipy.signal import find_peaks             # noqa: E402
 
 plt.rcParams.update({
     "font.family": "sans-serif", "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
@@ -37,12 +42,17 @@ DIR = ROOT / "data" / "raw" / "single_color_red" / "0714"
 WINDOWS = [(30.0, 40.0), (70.0, 80.0), (110.0, 120.0)]
 STIM_FILES = [DIR / f"{i}.csv" for i in range(1, 7)]
 CTRL_FILE = DIR / "Ctrl.csv"
-SIGMA, WIDTH, MINDIST = 4.0, 1.0, 5.0
-# representative ROIs: strong near-pixel responders (3,2), moderate (10,12),
-# and a distal non-responder (6) for specificity contrast.
-REP_ROIS = [3, 2, 10, 12, 6]
-ROI_NOTE = {3: "next to stim pixel", 2: "next to stim pixel",
-            6: "distal — minimal response"}
+# Prominence-based transient detector. Noise sigma is estimated from the lower
+# side of the distribution (median - 16th pct), which the positive-going calcium
+# transients cannot inflate -> stable threshold even when a transient sits in the
+# baseline window. A peak must clear both an absolute height and a prominence
+# (stand out from its neighbours), which rejects small noise bumps.
+K_PROM, K_HEIGHT, MIN_W_S, MIN_DIST_S = 4.0, 3.5, 1.0, 4.0
+# ROI.02/03 sit on top of the stim pixel: their in-window "peaks" are red-light
+# leakage into the GFP channel, not calcium. Exclude them entirely.
+EXCLUDE_ROIS = {2, 3}
+REP_ROIS = [10, 12, 9, 8, 7]
+ROI_NOTE = {7: "distal — sparse"}
 OUT = ROOT / "figures" / "0714"
 STIM_COLOR = "#C0392B"                  # red-ish (matches the stimulating pixel)
 
@@ -57,7 +67,7 @@ def prep(path: Path):
     t = df["Axis [s]"].to_numpy(float)
     roicols = [c for c in df.columns if "ROI" in c]
     bg = next(c for c in roicols if "ROI.01" in c)          # explicit background
-    det = [c for c in roicols if c != bg]
+    det = [c for c in roicols if c != bg and roinum(c) not in EXCLUDE_ROIS]
     bgv = df[bg].to_numpy(float)
     dd = {}
     for c in det:
@@ -68,12 +78,21 @@ def prep(path: Path):
     return tab, det
 
 
+def detect2(y, t, dt):
+    """Prominence-based calcium-transient detector with robust (lower-percentile)
+    noise. Returns event times. Includes pre-stim spontaneous transients."""
+    med = float(np.median(y))
+    sig = max(med - float(np.percentile(y, 16)), 1e-6)
+    pk, _ = find_peaks(y, height=med + K_HEIGHT * sig, prominence=K_PROM * sig,
+                       distance=max(1, int(round(MIN_DIST_S / dt))),
+                       width=max(1, int(round(MIN_W_S / dt))))
+    return t[pk]
+
+
 def detect(tab, det):
-    _, _, sp = bp.detect_spikes_across_rois(
-        tab, det, "Time (s)", baseline_range=(10, 30), spike_z_sigma=SIGMA,
-        min_distance_s=MINDIST, width_mode="fwhm", width_threshold_s=WIDTH,
-        stim_windows=WINDOWS, exclude_spikes_in_windows=False)
-    return sp
+    t = tab["Time (s)"].to_numpy()
+    dt = float(np.median(np.diff(t)))
+    return {c: detect2(tab[c].to_numpy(), t, dt) for c in det}
 
 
 def col_for(det, num):
@@ -85,33 +104,38 @@ def col_for(det, num):
 
 # ----------------------------------------------------------------- Figure A
 def figure_traces():
-    # load & detect all 6 stim files
-    recs = []
-    for f in STIM_FILES:
+    # load & detect the 6 stim files, then the control as a 7th segment (no stim)
+    recs = []  # (tab, det, sp, windows, label)
+    for k, f in enumerate(STIM_FILES):
         tab, det = prep(f)
-        recs.append((tab, det, detect(tab, det)))
+        recs.append((tab, det, detect(tab, det), WINDOWS, f"rec {k+1}"))
+    ctab, cdet = prep(CTRL_FILE)
+    recs.append((ctab, cdet, detect(ctab, cdet), [], "control"))
     T = float(recs[0][0]["Time (s)"].to_numpy()[-1]) + 0.5   # per-file span for offset
 
-    fig, axes = plt.subplots(len(REP_ROIS), 1, figsize=(11, 1.35 * len(REP_ROIS) + 0.6),
+    fig, axes = plt.subplots(len(REP_ROIS), 1, figsize=(12, 1.35 * len(REP_ROIS) + 0.6),
                              sharex=True)
     for row, rnum in enumerate(REP_ROIS):
         ax = axes[row]
-        # stim windows for all 6 concatenated files
         ymax_est = 0.02
         seg_all = []
-        for k, (tab, det, sp) in enumerate(recs):
+        for k, (tab, det, sp, wins, label) in enumerate(recs):
             off = k * T
             t = tab["Time (s)"].to_numpy() + off
             col = col_for(det, rnum)
             y = tab[col].to_numpy() if col else np.zeros_like(t)
-            seg_all.append((t, y, off, sp.get(col, []) if col else []))
+            seg_all.append((t, y, off, sp.get(col, []) if col else [], wins))
             ymax_est = max(ymax_est, np.nanpercentile(y, 99.5))
         ymin = -0.2 * ymax_est
         ytop = 1.15 * ymax_est
-        for k, (t, y, off, evs) in enumerate(seg_all):
-            for (s, e) in WINDOWS:
+        for k, (t, y, off, evs, wins) in enumerate(seg_all):
+            for (s, e) in wins:
                 ax.add_patch(Rectangle((s + off, ymin), e - s, ytop - ymin,
                              facecolor=STIM_COLOR, edgecolor="none", alpha=0.13, zorder=0))
+            # shade the control segment faint grey so it reads as a distinct block
+            if not wins:
+                ax.add_patch(Rectangle((off, ymin), T, ytop - ymin,
+                             facecolor="#000000", edgecolor="none", alpha=0.04, zorder=0))
             ax.plot(t, y, color="#1F4E79", lw=0.7, zorder=2)
             if len(evs):
                 ey = [float(y[np.argmin(np.abs(t - (ev + off)))]) for ev in evs]
@@ -127,12 +151,15 @@ def figure_traces():
         ax.text(0.004, 0.92, f"ROI.{rnum:02d}{note}", transform=ax.transAxes,
                 va="top", ha="left", fontsize=7.5, weight="bold",
                 bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1))
-    # file labels along the top
-    for k in range(len(recs)):
-        axes[0].text((k + 0.5) * T, axes[0].get_ylim()[1], f"rec {k+1}",
-                     ha="center", va="bottom", fontsize=6.5, color="#666")
-    axes[-1].set_xlabel("Concatenated time across 6 recordings (s)  —  red bands = 10 s stim windows")
-    fig.suptitle("0714 single-color: representative ROI traces, 6 stim recordings concatenated",
+    # segment labels along the top
+    for k, (_, _, _, _, label) in enumerate(recs):
+        axes[0].text((k + 0.5) * T, axes[0].get_ylim()[1], label,
+                     ha="center", va="bottom", fontsize=6.5,
+                     color="#555" if label == "control" else "#666",
+                     weight="bold" if label == "control" else "normal")
+    axes[-1].set_xlabel("Concatenated time: 6 stim recordings + no-light control  "
+                        "(red bands = 10 s stim windows; grey = control)")
+    fig.suptitle("0714 single-color: representative ROI traces — 6 stim recordings + control",
                  y=0.995, fontsize=10, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     OUT.mkdir(parents=True, exist_ok=True)
