@@ -55,25 +55,19 @@ def panel_image(ax):
     ax.imshow(np.dstack([_stretch(r), _stretch(g), np.zeros_like(g, float)]))
     coords = {int(k): tuple(v) for k, v in json.load(open(ROOT / "figures" / "_roi_png_0714.json")).items()}
     px = ((coords[2][0] + coords[3][0]) / 2, (coords[2][1] + coords[3][1]) / 2)
-    cxm = np.mean([v[0] for k, v in coords.items() if k != 1])
-    cym = np.mean([v[1] for k, v in coords.items() if k != 1])
     for n, (x, y) in coords.items():
         if n == 1:
             continue
         col = LEAKC if n in (2, 3) else (CYAN if n in BIO_ROIS else "white")
-        key = n in (2, 3) or n in BIO_ROIS
-        ax.add_patch(Circle((x, y), 30, fill=False, edgecolor=col, lw=3.4 if key else 1.8, zorder=3))
-        ang = np.arctan2(y - cym, x - cxm)
-        ax.text(x + 74 * np.cos(ang), y + 74 * np.sin(ang), f"{n:02d}", color=col, fontsize=16,
-                fontweight="bold", ha="center", va="center", zorder=4,
-                path_effects=[pe.withStroke(linewidth=3.6, foreground="black")])
-    ax.add_patch(Rectangle((px[0] - 44, px[1] - 44), 88, 88, fill=False, edgecolor="red", lw=3.6, zorder=5))
-    ax.text(px[0], px[1] - 104, "µLED", color="red", fontsize=15, fontweight="bold",
-            ha="center", va="bottom", zorder=5, path_effects=[pe.withStroke(linewidth=3.4, foreground="black")])
+        lw = 3.0 if n in (2, 3) + tuple(BIO_ROIS) else 1.6
+        ax.add_patch(Circle((x, y), 34, fill=False, edgecolor=col, lw=lw, zorder=3))
+        ax.text(x + 40, y - 40, f"{n:02d}", color=col, fontsize=13, fontweight="bold", zorder=4)
+    ax.add_patch(Rectangle((px[0] - 42, px[1] - 42), 84, 84, fill=False, edgecolor="red", lw=3.4, zorder=5))
+    ax.text(px[0] + 60, px[1] + 78, "µLED", color="red", fontsize=13, fontweight="bold", zorder=5)
     ax.text(0.03, 0.985, "GCaMP8s", color="#39FF9E", transform=ax.transAxes, va="top",
-            fontsize=15, fontweight="bold", path_effects=[pe.withStroke(linewidth=2.6, foreground="black")])
-    ax.text(0.03, 0.905, "ChrimsonR", color="#FF7A7A", transform=ax.transAxes, va="top",
-            fontsize=15, fontweight="bold", path_effects=[pe.withStroke(linewidth=2.6, foreground="black")])
+            fontsize=14, fontweight="bold")
+    ax.text(0.03, 0.915, "ChrimsonR", color="#FF7A7A", transform=ax.transAxes, va="top",
+            fontsize=14, fontweight="bold")
     ax.set_xlim(0, 2048); ax.set_ylim(2048, 0); ax.axis("off")
 
 
@@ -126,32 +120,36 @@ def panel_traces(fig, sub, recs):
     for ax in axes[:3]:
         ax.tick_params(labelbottom=False)
     axes[-1].set_xlabel("Time (s)", fontsize=16)
-    # large segment labels: C = control, 1-6 = stim recordings
-    seg = ["C", "1", "2", "3", "4", "5", "6"]
+    # segment labels: Ctrl + Rec 1-6, clearly legible but not oversized
+    seg = ["Ctrl", "Rec 1", "Rec 2", "Rec 3", "Rec 4", "Rec 5", "Rec 6"]
     for k, s in enumerate(seg):
         axes[0].text((k + 0.5) * T, 0.315, s, ha="center", va="bottom",
-                     fontsize=50, color="#4A4A4A", fontweight="bold")
+                     fontsize=17, color="#555", fontweight="bold")
 
 
 def panel_bar(ax):
     data, _ = F.collect_compare()
     ctrl = np.asarray(data["Control"]["counts"], float)
     stim = np.asarray(data["Stim"]["counts"], float)
-    ax.bar([0, 1], [ctrl.mean(), stim.mean()], 0.6, yerr=[sps.sem(ctrl), sps.sem(stim)],
-           capsize=7, error_kw=dict(lw=1.8), color=[GREY, STIM], edgecolor="black", lw=1.3, zorder=2)
     rng = np.random.default_rng(0)
-    for x, a in zip([0, 1], [ctrl, stim]):
-        ax.scatter(x + (rng.random(a.size) - 0.5) * 0.32, a, s=30, color="black",
-                   alpha=0.28, linewidths=0, zorder=3)
+    for x, a, c in [(0, ctrl, GREY), (1, stim, STIM)]:
+        m, se = float(a.mean()), float(sps.sem(a))
+        ax.bar(x, m, 0.56, color=c, alpha=0.80, edgecolor="none", zorder=2)
+        ax.scatter(x + (rng.random(a.size) - 0.5) * 0.24, a, s=40, facecolor="white",
+                   edgecolor=c, linewidths=1.6, alpha=0.95, zorder=3)
+        ax.errorbar(x, m, yerr=se, fmt="none", ecolor="#222", elinewidth=1.8,
+                    capsize=8, capthick=1.8, zorder=4)
     p = sps.mannwhitneyu(stim, ctrl, alternative="greater").pvalue
-    top = max(stim.max(), 1)
-    ax.plot([0, 0, 1, 1], [top*1.04, top*1.10, top*1.10, top*1.04], lw=1.5, c="black")
+    top = max(float(stim.max()), 0.5)
+    y0 = top * 1.05
+    ax.plot([0, 0, 1, 1], [y0, y0 + top*0.05, y0 + top*0.05, y0], lw=1.6, c="#222")
     star = "***" if p < 1e-3 else "**" if p < 1e-2 else "*" if p < 5e-2 else "ns"
-    ax.text(0.5, top*1.10, star, ha="center", va="bottom", fontsize=30, fontweight="bold")
+    ax.text(0.5, y0 + top*0.05, star, ha="center", va="bottom", fontsize=26, fontweight="bold")
     ax.set_xticks([0, 1]); ax.set_xticklabels(["No light", "Red µLED"], fontsize=17)
     ax.set_ylabel("Events / ROI", fontsize=17)
     ax.tick_params(axis="y", labelsize=13); ax.tick_params(axis="x", length=0)
-    ax.set_ylim(0, top*1.30)
+    ax.set_xlim(-0.62, 1.62); ax.set_ylim(0, top * 1.20)
+    ax.spines["left"].set_bounds(0, top)
 
 
 def main():
@@ -159,15 +157,15 @@ def main():
     fig = plt.figure(figsize=(13.2, 8.0), dpi=300)
     gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.72], height_ratios=[1.12, 0.9],
                           hspace=0.42, wspace=0.24, left=0.06, right=0.985,
-                          top=0.84, bottom=0.14)
+                          top=0.88, bottom=0.14)
     panel_image(fig.add_subplot(gs[0, 0]))
     panel_bar(fig.add_subplot(gs[1, 0]))
     panel_traces(fig, gs[:, 1].subgridspec(4, 1, hspace=0.20), recs)
-    # aligned panel letters + stimulus header (above the large segment labels)
-    fig.text(0.012, 0.965, "a", **PLET)
-    fig.text(0.44, 0.965, "b", **PLET)
-    fig.text(0.012, 0.45, "c", **PLET)
-    fig.text(0.985, 0.965, STIM_TXT, ha="right", va="top", fontsize=15, color="#333")
+    # aligned panel letters + stimulus header
+    fig.text(0.012, 0.955, "a", **PLET)
+    fig.text(0.44, 0.955, "b", **PLET)
+    fig.text(0.012, 0.47, "c", **PLET)
+    fig.text(0.985, 0.955, STIM_TXT, ha="right", va="top", fontsize=15, color="#333")
     base = ROOT / "figures" / "0714" / "fig_0714_showcase"
     for ext, kw in [(".svg", {}), (".pdf", {}), (".png", {"dpi": 300})]:
         try: fig.savefig(base.with_suffix(ext), facecolor="white", transparent=False, **kw)
