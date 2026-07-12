@@ -47,27 +47,39 @@ def _stretch(g, lo=2, hi=99.6):
     return np.clip((g - a) / (b - a + 1e-9), 0, 1)
 
 
-def panel_image(ax):
-    g = np.array(mpimg.imread(str(ASSETS / "contact_ch470_full.png")))
-    r = np.array(mpimg.imread(str(ASSETS / "contact_ch580.png")))
-    g = g[..., 0] if g.ndim == 3 else g
-    r = r[..., 0] if r.ndim == 3 else r
+def _load_gray(name):
+    a = np.array(mpimg.imread(str(ASSETS / name)))
+    return a[..., 0] if a.ndim == 3 else a
+
+
+def panel_merge(ax):
+    """Left image: clean two-colour fluorescence merge, no overlay."""
+    g, r = _load_gray("contact_ch470_full.png"), _load_gray("contact_ch580.png")
     ax.imshow(np.dstack([_stretch(r), _stretch(g), np.zeros_like(g, float)]))
+    ax.text(0.03, 0.985, "GCaMP8s", color="#39FF9E", transform=ax.transAxes, va="top",
+            fontsize=14, fontweight="bold")
+    ax.text(0.03, 0.915, "ChrimsonR", color="#FF7A7A", transform=ax.transAxes, va="top",
+            fontsize=14, fontweight="bold")
+    ax.set_xlim(0, 2048); ax.set_ylim(2048, 0); ax.axis("off")
+
+
+def panel_bf(ax):
+    """Right image: brightfield contact (Image058) with ROI + µLED overlay."""
+    ax.imshow(_stretch(_load_gray("contact_brightfield.png"), 1, 99.5), cmap="gray")
     coords = {int(k): tuple(v) for k, v in json.load(open(ROOT / "figures" / "_roi_png_0714.json")).items()}
     px = ((coords[2][0] + coords[3][0]) / 2, (coords[2][1] + coords[3][1]) / 2)
+    halo = [pe.withStroke(linewidth=2.6, foreground="black")]
     for n, (x, y) in coords.items():
         if n == 1:
             continue
         col = LEAKC if n in (2, 3) else (CYAN if n in BIO_ROIS else "white")
         lw = 3.0 if n in (2, 3) + tuple(BIO_ROIS) else 1.6
         ax.add_patch(Circle((x, y), 34, fill=False, edgecolor=col, lw=lw, zorder=3))
-        ax.text(x + 40, y - 40, f"{n:02d}", color=col, fontsize=13, fontweight="bold", zorder=4)
+        ax.text(x + 40, y - 40, f"{n:02d}", color=col, fontsize=13, fontweight="bold",
+                zorder=4, path_effects=halo)
     ax.add_patch(Rectangle((px[0] - 42, px[1] - 42), 84, 84, fill=False, edgecolor="red", lw=3.4, zorder=5))
-    ax.text(px[0] + 60, px[1] + 78, "µLED", color="red", fontsize=13, fontweight="bold", zorder=5)
-    ax.text(0.03, 0.985, "GCaMP8s", color="#39FF9E", transform=ax.transAxes, va="top",
-            fontsize=14, fontweight="bold")
-    ax.text(0.03, 0.915, "ChrimsonR", color="#FF7A7A", transform=ax.transAxes, va="top",
-            fontsize=14, fontweight="bold")
+    ax.text(px[0] + 60, px[1] + 78, "µLED", color="red", fontsize=13, fontweight="bold",
+            zorder=5, path_effects=halo)
     ax.set_xlim(0, 2048); ax.set_ylim(2048, 0); ax.axis("off")
 
 
@@ -155,10 +167,12 @@ def panel_bar(ax):
 def main():
     recs = _recs()
     fig = plt.figure(figsize=(13.2, 8.0), dpi=300)
-    gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.72], height_ratios=[1.12, 0.9],
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.22, 1.62], height_ratios=[1.12, 0.9],
                           hspace=0.42, wspace=0.24, left=0.06, right=0.985,
                           top=0.88, bottom=0.14)
-    panel_image(fig.add_subplot(gs[0, 0]))
+    sub_a = gs[0, 0].subgridspec(1, 2, wspace=0.06)
+    panel_merge(fig.add_subplot(sub_a[0]))
+    panel_bf(fig.add_subplot(sub_a[1]))
     panel_bar(fig.add_subplot(gs[1, 0]))
     panel_traces(fig, gs[:, 1].subgridspec(4, 1, hspace=0.20), recs)
     # aligned panel letters + stimulus header
