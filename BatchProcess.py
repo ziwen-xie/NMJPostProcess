@@ -57,10 +57,11 @@ class Config:
     # ΔF/F baseline
     baseline_window_half_s: float = 15.0
     baseline_percentile: float = 8.0
-    # Normalize ΔF/F by the RAW ROI baseline (always positive) instead of the
-    # background-subtracted baseline. Prevents negative / near-zero denominators
-    # (and the resulting sign-inverted / blown-up traces) on dim ROIs.
-    dff_normalize_by_raw: bool = True
+    # ΔF/F denominator. False (default, standard) = divide by the background-
+    # CORRECTED baseline (cell resting signal above background), floored to stay
+    # robust on dim ROIs — the physically correct fractional change. True =
+    # legacy divide-by-RAW baseline, which deflates ΔF/F ~roughly by (1 + bg/signal).
+    dff_normalize_by_raw: bool = False
 
     # Stimulation windows
     stim_preset: str = "20s"
@@ -289,16 +290,24 @@ def dff_percentile_window(
         window_half_s: float,
         percentile: float,
         F_denom: Optional[np.ndarray] = None,
+        denom_floor: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Moving-window percentile ΔF/F₀.
 
-    F        : trace to normalize (typically background-subtracted).
-    F_denom  : optional trace whose moving-percentile baseline is used as the
-               denominator (e.g. the RAW ROI fluorescence, which is always
-               positive). When given, ΔF/F = (F - F0) / F0_raw, which avoids the
-               negative / near-zero denominators produced by normalizing a
-               background-subtracted trace by its own baseline. When None, the
-               denominator is F0 of F (legacy behavior).
+    Standard calcium-imaging normalization (Jia et al. 2011, Nat. Protoc.;
+    Chen et al. 2013): ΔF/F₀ = (F - F0)/F0, where F is the background-corrected
+    trace and F0 is the corrected baseline (the cell's resting fluorescence
+    ABOVE background). Dividing by the corrected baseline — not the raw baseline
+    (which still contains the background offset) — is what gives the true
+    fractional change; dividing by the raw baseline deflates ΔF/F.
+
+    F        : trace to normalize (background-corrected).
+    F_denom  : optional separate trace whose moving-percentile baseline is the
+               denominator (e.g. the RAW trace). Legacy / debugging; NOT standard.
+    denom_floor : floor the denominator at this positive value. Keeps the standard
+               (divide-by-corrected-baseline) formula robust when a cell is only
+               marginally above background (tiny/negative F0) — prevents blow-up
+               and sign inversion without inflating ΔF/F on healthy ROIs.
     Returns (dff, F0) where F0 is the numerator baseline of F.
     """
     n = F.size
@@ -312,10 +321,11 @@ def dff_percentile_window(
         F0[i] = np.percentile(F[idx], percentile)
         if use_sep_denom:
             F0_den[i] = np.percentile(F_denom[idx], percentile)
-    # ΔF/F₀ = (F - F0) / denom. Guard exact/near-zero denominators against
-    # division by zero; never take abs() (that would invert transient signs).
     denom = F0_den.copy()
-    denom[np.abs(denom) < 1e-9] = 1e-9
+    if denom_floor is not None and denom_floor > 0:
+        denom[denom < denom_floor] = denom_floor      # positive floor (robust)
+    else:
+        denom[np.abs(denom) < 1e-9] = 1e-9
     dff = (F - F0) / denom
     return dff, F0
 
@@ -372,9 +382,16 @@ def compute_all_dff(
     for col in roi_cols:
         F_raw = df_main[col].to_numpy(dtype=float)
         F_corr = background_subtraction(F_raw, bg_vec)
-        # Normalize by the RAW baseline (always positive) rather than the
-        # background-subtracted baseline, unless disabled in config.
-        F_denom = F_raw if getattr(cfg, "dff_normalize_by_raw", True) else None
+        # Standard ΔF/F divides by the CORRECTED baseline (cell resting signal
+        # above background). Floor the denominator at a small fraction of the raw
+        # baseline so a cell only marginally above background can't blow up or
+        # invert. Set dff_normalize_by_raw=True only to reproduce the old
+        # (deflated) divide-by-raw behavior.
+        if getattr(cfg, "dff_normalize_by_raw", False):
+            F_denom, floor = F_raw, None
+        else:
+            F_denom = None
+            floor = 0.03 * abs(float(np.percentile(F_raw, cfg.baseline_percentile)))
 
         if use_shared_baseline and col in cfg.shared_baseline_values:
             # Use fixed baseline from shared baseline values
@@ -393,7 +410,7 @@ def compute_all_dff(
                 F_corr, t,
                 window_half_s=cfg.baseline_window_half_s,
                 percentile=cfg.baseline_percentile,
-                F_denom=F_denom,
+                F_denom=F_denom, denom_floor=floor,
             )
 
         dff_dict[col] = dff_vals

@@ -50,9 +50,9 @@ CTRL_FILE = DIR / "Ctrl.csv"
 # transients cannot inflate -> stable threshold even when a transient sits in the
 # baseline window. A peak must clear both an absolute height and a prominence
 # (stand out from its neighbours), which rejects small noise bumps.
-# kp=4.5/kh=4.0 is the threshold at which the no-light control has zero events
-# while the real stim transients (incl. the reviewer's ROI.12 examples) survive.
-K_PROM, K_HEIGHT, MIN_W_S, MIN_DIST_S = 4.5, 4.0, 1.0, 4.0
+# kp=5.0/kh=4.5: threshold at which the no-light control has zero events while
+# the real stim transients survive (retuned for corrected-baseline ΔF/F).
+K_PROM, K_HEIGHT, MIN_W_S, MIN_DIST_S = 5.0, 4.5, 1.0, 4.0
 EXCLUDE_ROIS = set()          # keep every ROI (ROI.01 background is still dropped)
 # ROI.02/03 sit on the stim pixel: their IN-WINDOW peaks are red-light leakage,
 # not calcium. Keep the ROIs (they complete the story) but drop only their
@@ -87,7 +87,9 @@ def prep(path: Path):
     dd = {}
     for c in det:
         raw = df[c].to_numpy(float)
-        dff, _ = bp.dff_percentile_window(raw - bgv, t, 15.0, 8.0, F_denom=raw)
+        # standard ΔF/F: divide by the background-corrected baseline (floored)
+        floor = 0.03 * abs(float(np.percentile(raw, 8)))
+        dff, _ = bp.dff_percentile_window(raw - bgv, t, 15.0, 8.0, denom_floor=floor)
         dd[c] = dff
     tab = pd.DataFrame(dd); tab.insert(0, "Time (s)", t)
     return tab, det
@@ -212,7 +214,7 @@ def figure_traces():
     return _draw_traces(
         REP_ROIS, OUT / "fig_0714_A_example_traces",
         "0714 single-color: representative ROI traces — control + 6 stim recordings",
-        fixed_ylim=(-0.006, 0.028))
+        fixed_ylim=(-0.08, 0.50))
 
 
 def figure_all_traces():
