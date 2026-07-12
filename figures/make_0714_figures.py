@@ -136,7 +136,7 @@ def col_for(det, num):
 
 
 # ----------------------------------------------------------------- Trace figures
-def _draw_traces(rois, base, title, height_per=1.35):
+def _draw_traces(rois, base, title, height_per=1.35, fixed_ylim=None):
     # load & detect the control (1st segment) then the 6 stim files
     recs = []  # (tab, det, sp, windows, label) -- control first
     ctab, cdet = prep(CTRL_FILE)
@@ -160,8 +160,11 @@ def _draw_traces(rois, base, title, height_per=1.35):
             y = tab[col].to_numpy() if col else np.zeros_like(t)
             seg_all.append((t, y, off, sp.get(col, []) if col else [], wins))
             ymax_est = max(ymax_est, np.nanpercentile(y, 99.5))
-        ymin = -0.2 * ymax_est
-        ytop = 1.15 * ymax_est
+        if fixed_ylim is not None:      # shared scale (leak ROIs clip at the top)
+            ymin, ytop = fixed_ylim
+        else:
+            ymin = -0.2 * ymax_est
+            ytop = 1.15 * ymax_est
         for k, (t, y, off, evs, wins) in enumerate(seg_all):
             for (s, e) in wins:
                 ax.add_patch(Rectangle((s + off, ymin), e - s, ytop - ymin,
@@ -204,9 +207,12 @@ def _draw_traces(rois, base, title, height_per=1.35):
 
 
 def figure_traces():
+    # shared y-scale so ROI.03's large light-leakage peaks clip and the real
+    # events read at the same scale as ROI.10/12 (we care about events, not leakage)
     return _draw_traces(
         REP_ROIS, OUT / "fig_0714_A_example_traces",
-        "0714 single-color: representative ROI traces — control + 6 stim recordings")
+        "0714 single-color: representative ROI traces — control + 6 stim recordings",
+        fixed_ylim=(-0.006, 0.028))
 
 
 def figure_all_traces():
