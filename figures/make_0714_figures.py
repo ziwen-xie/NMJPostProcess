@@ -63,11 +63,16 @@ ALL_ROIS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 ROI_NOTE = {3: "near pixel (in-window = light leakage, unmarked)",
             2: "near pixel (in-window = light leakage, unmarked)", 7: "distal"}
 
-# approximate ROI positions from the reference map (image pixels; y grows down)
-ROI_XY = {13: (115, 93), 5: (145, 167), 3: (237, 184), 2: (302, 197), 4: (350, 222),
-          6: (173, 277), 9: (298, 265), 8: (270, 278), 10: (357, 304), 12: (326, 339),
-          11: (263, 350), 14: (237, 459), 7: (137, 487)}
-PIXEL_XY = (312, 172)         # the stimulating red pixel
+# Real ROI centres (µm) parsed from the Leica ROI.roi; falls back to nothing if
+# the coords file is missing. Stim pixel = midpoint of ROI.02/03 (on the pixel).
+import json as _json  # noqa: E402
+_coords_file = ROOT / "figures" / "_roi_coords_0714.json"
+if _coords_file.exists():
+    _c = {int(k): tuple(v) for k, v in _json.load(open(_coords_file)).items()}
+    ROI_XY = {n: xy for n, xy in _c.items() if n != 1}      # drop background ROI.01
+    PIXEL_XY = ((_c[2][0] + _c[3][0]) / 2, (_c[2][1] + _c[3][1]) / 2)
+else:
+    ROI_XY, PIXEL_XY = {}, (0.0, 0.0)
 OUT = ROOT / "figures" / "0714"
 STIM_COLOR = "#C0392B"                  # red-ish (matches the stimulating pixel)
 
