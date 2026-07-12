@@ -143,22 +143,17 @@ def panel_bar(ax):
     data, _ = F.collect_compare()
     ctrl = np.asarray(data["Control"]["counts"], float)
     stim = np.asarray(data["Stim"]["counts"], float)
-    rng = np.random.default_rng(0)
-    for x, a, c in [(0, ctrl, GREY), (1, stim, STIM)]:
-        m, se = float(a.mean()), float(sps.sem(a))
-        ax.bar(x, m, 0.56, color=c, alpha=0.80, edgecolor="none", zorder=2)
-        ax.scatter(x + (rng.random(a.size) - 0.5) * 0.24, a, s=40, facecolor="white",
-                   edgecolor=c, linewidths=1.6, alpha=0.95, zorder=3)
-        ax.errorbar(x, m, yerr=se, fmt="none", ecolor="#222", elinewidth=1.8,
-                    capsize=8, capthick=1.8, zorder=4)
+    tot_c, tot_s = float(ctrl.sum()), float(stim.sum())
+    ax.bar([0, 1], [tot_c, tot_s], 0.56, color=[GREY, STIM], alpha=0.85,
+           edgecolor="black", lw=1.2, zorder=2)
     p = sps.mannwhitneyu(stim, ctrl, alternative="greater").pvalue
-    top = max(float(stim.max()), 0.5)
-    y0 = top * 1.05
+    top = max(tot_s, 1.0)
+    y0 = top * 1.04
     ax.plot([0, 0, 1, 1], [y0, y0 + top*0.05, y0 + top*0.05, y0], lw=1.6, c="#222")
     star = "***" if p < 1e-3 else "**" if p < 1e-2 else "*" if p < 5e-2 else "ns"
     ax.text(0.5, y0 + top*0.05, star, ha="center", va="bottom", fontsize=26, fontweight="bold")
     ax.set_xticks([0, 1]); ax.set_xticklabels(["No light", "Red µLED"], fontsize=17)
-    ax.set_ylabel("Events / ROI", fontsize=17)
+    ax.set_ylabel("Total events", fontsize=17)
     ax.tick_params(axis="y", labelsize=13); ax.tick_params(axis="x", length=0)
     ax.set_xlim(-0.62, 1.62); ax.set_ylim(0, top * 1.20)
     ax.spines["left"].set_bounds(0, top)
