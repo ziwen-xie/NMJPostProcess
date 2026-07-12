@@ -5,16 +5,19 @@ after another) + one no-light control (Ctrl.csv). 14 ROIs, 2 fps, ~155 s each,
 three 10 s stim windows per file at 30-40 / 70-80 / 110-120 s. ROI.01 = background.
 
 Outputs (figures/0714/):
-  A) example traces of representative ROIs, 6 stim recordings + the no-light
-     control CONCATENATED into one timeline (18 stim windows + control block)
+  A) example ΔF/F traces of representative ROIs (03, 10, 12), control + 6 stim
+     recordings CONCATENATED into one timeline (control block first, then 18 windows)
   B) Control vs Stim comparison: event count / amplitude / latency
+  C) all-ROI ΔF/F traces (same concatenated timeline, every ROI)
+  D) spatial response map over the ROI layout, stim pixel marked
 
-ROI.02/03 sit on the stim pixel -> their in-window peaks are red-light leakage,
-not calcium, so they are excluded. Detection: ROI.01 background, raw-baseline
-dF/F, prominence-based peak detector (robust lower-percentile noise; peaks must
-clear both height and prominence >= k*sigma) which catches obvious transients
-(incl. pre-stim spontaneous) while rejecting small noise bumps. Latency from
-stim onset (stimulated recordings only).
+ROI.02/03 sit on the stim pixel -> their IN-WINDOW peaks are red-light leakage,
+not calcium; the ROIs are kept but their in-window events are not marked/counted.
+Detection: ROI.01 background, raw-baseline dF/F, prominence-based peak detector
+(robust lower-percentile noise; peaks clear both height and prominence >=k*sigma;
+truncated-onset transients at a recording start are also recovered) which catches
+obvious transients (incl. pre-stim spontaneous) while rejecting noise. Thresholds
+tuned so the no-light control has zero events. Latency from stim onset (stim only).
 """
 from __future__ import annotations
 import os, re, sys
@@ -47,13 +50,16 @@ CTRL_FILE = DIR / "Ctrl.csv"
 # transients cannot inflate -> stable threshold even when a transient sits in the
 # baseline window. A peak must clear both an absolute height and a prominence
 # (stand out from its neighbours), which rejects small noise bumps.
-K_PROM, K_HEIGHT, MIN_W_S, MIN_DIST_S = 4.0, 3.5, 1.0, 4.0
+# kp=4.5/kh=4.0 is the threshold at which the no-light control has zero events
+# while the real stim transients (incl. the reviewer's ROI.12 examples) survive.
+K_PROM, K_HEIGHT, MIN_W_S, MIN_DIST_S = 4.5, 4.0, 1.0, 4.0
 EXCLUDE_ROIS = set()          # keep every ROI (ROI.01 background is still dropped)
 # ROI.02/03 sit on the stim pixel: their IN-WINDOW peaks are red-light leakage,
 # not calcium. Keep the ROIs (they complete the story) but drop only their
 # in-window events from marking/counting.
 LEAK_ROIS = {2, 3}
-REP_ROIS = [3, 2, 10, 12, 9, 7]
+REP_ROIS = [3, 10, 12]
+ALL_ROIS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 ROI_NOTE = {3: "near pixel (in-window = light leakage, unmarked)",
             2: "near pixel (in-window = light leakage, unmarked)", 7: "distal"}
 
@@ -129,9 +135,9 @@ def col_for(det, num):
     return None
 
 
-# ----------------------------------------------------------------- Figure A
-def figure_traces():
-    # load & detect the 6 stim files, then the control as a 7th segment (no stim)
+# ----------------------------------------------------------------- Trace figures
+def _draw_traces(rois, base, title, height_per=1.35):
+    # load & detect the control (1st segment) then the 6 stim files
     recs = []  # (tab, det, sp, windows, label) -- control first
     ctab, cdet = prep(CTRL_FILE)
     recs.append((ctab, cdet, detect(ctab, cdet, []), [], "control"))
@@ -140,9 +146,10 @@ def figure_traces():
         recs.append((tab, det, detect(tab, det, WINDOWS), WINDOWS, f"rec {k+1}"))
     T = float(recs[0][0]["Time (s)"].to_numpy()[-1]) + 0.5   # per-file span for offset
 
-    fig, axes = plt.subplots(len(REP_ROIS), 1, figsize=(12, 1.35 * len(REP_ROIS) + 0.6),
+    fig, axes = plt.subplots(len(rois), 1, figsize=(12, height_per * len(rois) + 0.6),
                              sharex=True)
-    for row, rnum in enumerate(REP_ROIS):
+    axes = np.atleast_1d(axes)
+    for row, rnum in enumerate(rois):
         ax = axes[row]
         ymax_est = 0.02
         seg_all = []
@@ -186,16 +193,27 @@ def figure_traces():
                      weight="bold" if label == "control" else "normal")
     axes[-1].set_xlabel("Concatenated time: no-light control + 6 stim recordings  "
                         "(grey = control; red bands = 10 s stim windows)")
-    fig.suptitle("0714 single-color: representative ROI traces — control + 6 stim recordings",
-                 y=0.995, fontsize=10, weight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.suptitle(title, y=0.997, fontsize=10, weight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
     OUT.mkdir(parents=True, exist_ok=True)
-    base = OUT / "fig_0714_A_example_traces"
     for ext, kw in [(".svg", {}), (".pdf", {}), (".png", {"dpi": 300})]:
         try: fig.savefig(base.with_suffix(ext), facecolor="white", **kw)
         except PermissionError: print(f"  locked: {base.with_suffix(ext).name}")
     plt.close(fig)
     return base.with_suffix(".svg")
+
+
+def figure_traces():
+    return _draw_traces(
+        REP_ROIS, OUT / "fig_0714_A_example_traces",
+        "0714 single-color: representative ROI traces — control + 6 stim recordings")
+
+
+def figure_all_traces():
+    return _draw_traces(
+        ALL_ROIS, OUT / "fig_0714_C_all_roi_traces",
+        "0714 single-color: all-ROI ΔF/F traces — control + 6 stim recordings",
+        height_per=0.95)
 
 
 # ----------------------------------------------------------------- Figure B
@@ -230,39 +248,6 @@ def collect_compare():
     for f in STIM_FILES:
         add("Stim", f, WINDOWS)
     return out, perroi
-
-
-def figure_allroi(perroi):
-    """Per-ROI event rate: control vs stim, every ROI shown."""
-    rois = sorted(perroi)
-    x = np.arange(len(rois))
-    ctrl = [perroi[r]["control"] for r in rois]
-    smean = [float(np.mean(perroi[r]["stim"])) if perroi[r]["stim"] else 0.0 for r in rois]
-    ssem = [sps.sem(perroi[r]["stim"]) if len(perroi[r]["stim"]) > 1 else 0.0 for r in rois]
-    fig, ax = plt.subplots(figsize=(9.2, 3.4))
-    w = 0.4
-    ax.bar(x - w/2, ctrl, w, color="#7F7F7F", edgecolor="black", lw=0.6, label="Control (1 rec)")
-    ax.bar(x + w/2, smean, w, yerr=ssem, capsize=2.5, color=STIM_COLOR, edgecolor="black",
-           lw=0.6, error_kw=dict(lw=0.6), label="Stim (mean of 6 recs)")
-    rng = np.random.default_rng(1)
-    for xi, r in zip(x, rois):
-        s = perroi[r]["stim"]
-        if s:
-            ax.scatter(np.full(len(s), xi + w/2) + (rng.random(len(s)) - 0.5) * 0.2, s,
-                       s=6, color="black", alpha=0.35, zorder=3, linewidths=0)
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"{r:02d}" + ("*" if r in LEAK_ROIS else "") for r in rois])
-    ax.set_xlabel("ROI  (* = in-window events dropped: on stim pixel)")
-    ax.set_ylabel("Events / recording")
-    ax.set_title("0714 per-ROI response: control vs stim", fontsize=9.5, weight="bold")
-    ax.legend(frameon=False, fontsize=7.5)
-    fig.tight_layout()
-    base = OUT / "fig_0714_C_per_roi"
-    for ext, kw in [(".svg", {}), (".pdf", {}), (".png", {"dpi": 300})]:
-        try: fig.savefig(base.with_suffix(ext), facecolor="white", **kw)
-        except PermissionError: print(f"  locked: {base.with_suffix(ext).name}")
-    plt.close(fig)
-    return base.with_suffix(".svg")
 
 
 def figure_spatial(perroi):
@@ -355,7 +340,7 @@ def main():
     a = figure_traces()
     data, perroi = collect_compare()
     b = figure_compare(data)
-    c = figure_allroi(perroi)
+    c = figure_all_traces()
     d = figure_spatial(perroi)
     print("Control events/ROI mean:", round(np.mean(data["Control"]["counts"]), 3),
           "| total control events:", int(np.sum(data["Control"]["counts"])))
