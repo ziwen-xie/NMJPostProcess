@@ -291,6 +291,7 @@ def dff_percentile_window(
         percentile: float,
         F_denom: Optional[np.ndarray] = None,
         denom_floor: Optional[float] = None,
+        exclude_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Moving-window percentile ΔF/F₀.
 
@@ -308,19 +309,28 @@ def dff_percentile_window(
                (divide-by-corrected-baseline) formula robust when a cell is only
                marginally above background (tiny/negative F0) — prevents blow-up
                and sign inversion without inflating ΔF/F on healthy ROIs.
+    exclude_mask : boolean array (True = exclude that time point from the baseline
+               percentile). Use it to keep stimulation-window light leakage OUT of
+               the moving baseline so a sustained in-window artifact cannot pull F0
+               up and distort the response shape. Excluded points are still
+               normalized; their baseline is taken from the surrounding kept points.
     Returns (dff, F0) where F0 is the numerator baseline of F.
     """
     n = F.size
     F0 = np.zeros_like(F, dtype=float)          # numerator baseline (of F)
     use_sep_denom = F_denom is not None
     F0_den = np.zeros_like(F, dtype=float) if use_sep_denom else F0
+    keep = ~exclude_mask if exclude_mask is not None else np.ones(n, dtype=bool)
     for i in range(n):
         t0 = max(t[0], t[i] - window_half_s)
         t1 = min(t[-1], t[i] + window_half_s)
         idx = (t >= t0) & (t <= t1)
-        F0[i] = np.percentile(F[idx], percentile)
+        idxk = idx & keep
+        if not idxk.any():          # whole window excluded -> fall back to all points
+            idxk = idx
+        F0[i] = np.percentile(F[idxk], percentile)
         if use_sep_denom:
-            F0_den[i] = np.percentile(F_denom[idx], percentile)
+            F0_den[i] = np.percentile(F_denom[idxk], percentile)
     denom = F0_den.copy()
     if denom_floor is not None and denom_floor > 0:
         denom[denom < denom_floor] = denom_floor      # positive floor (robust)

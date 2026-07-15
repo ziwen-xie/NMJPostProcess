@@ -50,32 +50,36 @@ CELL_ROIS = list(range(2, 47))
 def roin(c): return int(re.search(r"ROI\.0*(\d+)", c).group(1))
 
 
+def in_window(t):
+    return np.array([any(s <= x <= e for s, e in WIN) for x in t])
+
+
 def prep(f):
     df = pd.read_csv(DATA / f, encoding="utf-16", skiprows=1)
     t = df["Axis [s]"].to_numpy(float)
     cols = [c for c in df.columns if "ROI" in c]
     bg = df[next(c for c in cols if roin(c) == BGROI)].to_numpy(float)
+    mask = in_window(t)          # keep in-window light leakage OUT of the baseline
     dd = {}
     for c in cols:
         if roin(c) == BGROI:
             continue
         raw = df[c].to_numpy(float); floor = 0.03 * abs(float(np.percentile(raw, 8)))
-        dff, _ = bp.dff_percentile_window(raw - bg, t, 15.0, 8.0, denom_floor=floor)
+        dff, _ = bp.dff_percentile_window(raw - bg, t, 15.0, 8.0, denom_floor=floor, exclude_mask=mask)
         dd[roin(c)] = dff
     return dd, t
 
 
 def detect(y, t, is_blue):
-    dt = float(np.median(np.diff(t))); med = float(np.median(y)); sig = max(med - float(np.percentile(y, 16)), 1e-9)
+    dt = float(np.median(np.diff(t)))
+    keep = ~in_window(t)         # estimate noise/threshold from OUT-of-window points only
+    yk = y[keep] if keep.any() else y
+    med = float(np.median(yk)); sig = max(med - float(np.percentile(yk, 16)), 1e-9)
     pk, _ = find_peaks(y, height=med + KH * sig, prominence=KP * sig, distance=max(1, int(4 / dt)), width=max(1, int(1 / dt)))
     ev = t[pk]
     if is_blue:
         ev = ev[[not any(s <= x <= e for s, e in WIN) for x in ev]]
     return ev
-
-
-def in_window(t):
-    return np.array([any(s <= x <= e for s, e in WIN) for x in t])
 
 
 def main():
@@ -115,9 +119,9 @@ def main():
                      fontsize=8.5, color=colr, fontweight="bold")
     axes[-1].set_xlabel("Time (s) — Ctrl | Ctrl2 | blue µLED ×3 | red µLED ×3   (shaded = 20 s stim windows; "
                         "○ = detected event; blue in-window leakage excluded)", fontsize=10)
-    fig.suptitle("0824 dual-color — ΔF/F of every cell ROI (02–46; ROI.01 = background).  "
-                 "Ctrl = no-light (silent, 0 ev); Ctrl2 = light control (57); blue = 171; red = 12 out-of-window events",
-                 y=0.998, fontsize=12, fontweight="bold")
+    fig.suptitle("0824 dual-color — ΔF/F of every cell ROI (02–46; ROI.01 = background), baseline EXCLUDES in-window leakage.  "
+                 "Ctrl = no-light (silent, 1 ev); Ctrl2 = light control (43); blue = 0; red = 14 out-of-window events",
+                 y=0.998, fontsize=11.5, fontweight="bold")
     fig.text(0.004, 0.5, "ROI", rotation=90, va="center", fontsize=10, fontweight="bold")
     fig.tight_layout(rect=(0.011, 0, 1, 0.99))
     base = ROOT / "figures" / "0824" / "fig_0824_all_roi"
