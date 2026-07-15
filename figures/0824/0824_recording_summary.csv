@@ -1,0 +1,8 @@
+recording,file,events_kept,events_in_analysis_window_kept,events_outside_analysis_window_kept,stim_window_events_excluded,active_rois
+Ctrl,Ctrl.csv,0,0,0,1,0
+blue 1,blue1.csv,0,0,0,145,0
+blue 2,blue2.csv,0,0,0,139,0
+blue 3,blue3.csv,0,0,0,134,0
+red 1,red1.csv,0,0,0,6,0
+red 2,red2.csv,0,0,0,4,0
+red 3,red3.csv,0,0,0,4,0
