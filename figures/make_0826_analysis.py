@@ -54,18 +54,22 @@ def prep(f):
     t = df["Axis [s]"].to_numpy(float)
     cols = [c for c in df.columns if "ROI" in c]
     bg = df[next(c for c in cols if roin(c) == BGROI)].to_numpy(float)
+    mask = np.array([any(s <= x <= e for s, e in WIN) for x in t])   # exclude leakage from baseline
     dd = {}
     for c in cols:
         if roin(c) == BGROI:
             continue
         raw = df[c].to_numpy(float); floor = 0.03 * abs(float(np.percentile(raw, 8)))
-        dff, _ = bp.dff_percentile_window(raw - bg, t, 15.0, 8.0, denom_floor=floor)
+        dff, _ = bp.dff_percentile_window(raw - bg, t, 15.0, 8.0, denom_floor=floor, exclude_mask=mask)
         dd[roin(c)] = dff
     return dd, t
 
 
 def detect(y, t, is_blue):
-    dt = float(np.median(np.diff(t))); med = float(np.median(y)); sig = max(med - float(np.percentile(y, 16)), 1e-9)
+    dt = float(np.median(np.diff(t)))
+    keep = ~np.array([any(s <= x <= e for s, e in WIN) for x in t])   # noise from out-of-window
+    yk = y[keep] if keep.any() else y
+    med = float(np.median(yk)); sig = max(med - float(np.percentile(yk, 16)), 1e-9)
     pk, _ = find_peaks(y, height=med + KH * sig, prominence=KP * sig, distance=max(1, int(4 / dt)), width=max(1, int(1 / dt)))
     ev = t[pk]
     if is_blue:

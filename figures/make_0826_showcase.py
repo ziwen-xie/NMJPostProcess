@@ -54,16 +54,19 @@ def roin(c): return int(re.search(r"ROI\.0*(\d+)", c).group(1))
 def prep(f):
     df = pd.read_csv(DATA / f, encoding="utf-16", skiprows=1)
     t = df["Axis [s]"].to_numpy(float); cols = [c for c in df.columns if "ROI" in c]; dd = {}
+    mask = np.array([any(s <= x <= e for s, e in WIN) for x in t])   # exclude leakage from baseline
     for c in cols:
-        dff, _ = bp.dff_percentile_window(df[c].to_numpy(float), t, 15.0, 8.0)
+        dff, _ = bp.dff_percentile_window(df[c].to_numpy(float), t, 15.0, 8.0, exclude_mask=mask)
         dd[c] = dff
     return pd.DataFrame(dd), cols, t
 
 
 def detect(tab, cols, t, is_blue):
     dt = float(np.median(np.diff(t))); out = {}
+    keep = ~np.array([any(s <= x <= e for s, e in WIN) for x in t])   # noise from out-of-window
     for c in cols:
-        y = tab[c].to_numpy(); med = float(np.median(y)); sig = max(med - float(np.percentile(y, 16)), 1e-9)
+        y = tab[c].to_numpy(); yk = y[keep] if keep.any() else y
+        med = float(np.median(yk)); sig = max(med - float(np.percentile(yk, 16)), 1e-9)
         pk, _ = find_peaks(y, height=med + KH * sig, prominence=KP * sig, distance=max(1, int(4 / dt)), width=max(1, int(1 / dt)))
         ev = t[pk]
         if is_blue:
